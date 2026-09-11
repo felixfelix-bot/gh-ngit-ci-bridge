@@ -1,0 +1,81 @@
+{
+  "comment": "Committed config for gh-ngit-ci-bridge. No secrets: the ngit signing key stays in key_file (mode 600) and GitHub auth comes from the gh CLI.",
+  "poll_interval_minutes": 5,
+
+  "state_dir": "~/.local/state/gh-ngit-ci-bridge",
+  "log_file": "~/.local/state/gh-ngit-ci-bridge/bridge.log",
+  "cache_dir": "~/.local/share/gh-ngit-ci-bridge/cache",
+
+  "key_file": "~/.hermes/.ngit-new-key",
+  "signer_python": "/opt/miniconda/bin/python3",
+
+  "coordinator_hex": "765cd47badcbbc4a38c7d0c57d5607663b484c20cd59773f9f7064487f9431e8",
+  "ngit_owner_hex": "36bdeb239fbebe0ef4f9d50e92ae1583cda2a9c81df015ba91a1fde726dc74e0",
+  "ngit_owner_npub": "npub1x677kgulh6lqaa8e658f9ts4s0x692wgrhcptw535877wfkuwnsqztaquc",
+  "relays": ["wss://relay.ngit.dev", "wss://gitnostr.com"],
+
+  "watched_identities": [
+    "felixfelix-bot",
+    "c03rad0r",
+    "Amperstrand",
+    "Origami74",
+    "Franchovy",
+    "maximotodev",
+    "hkarani"
+  ],
+
+  "email_to_login": {
+    "felix@embedsmart.de": "felixfelix-bot",
+    "c03rad0r@proton.me": "c03rad0r"
+  },
+
+  "branches": ["main", "master"],
+  "trigger_mode": "mirror",
+  "also_manual_when_workflows": false,
+  "baseline_on_first_run": true,
+  "commits_per_poll": 20,
+  "mirror_refresh_minutes": 60,
+  "org_cache_minutes": 360,
+  "state_event_wait_seconds": 8,
+
+  "orgs": ["OpenTollGate", "PlebeianApp", "FreedomTechFeed"],
+
+  "repos": {
+    "OpenTollGate/tollgate-module-basic-go": {
+      "ngit_repo_id": "tollgate-module-basic-go",
+      "note": "mirror exists; .ngit/act/workflows/test.yml present; standing Service Request published"
+    },
+    "OpenTollGate/tollgate-infrastructure-kit": {"ngit_repo_id": "tollgate-infrastructure-kit"},
+    "OpenTollGate/tollgate-rs": {"ngit_repo_id": "tollgate-rs"},
+    "OpenTollGate/tollgate-nostr-daemon": {"ngit_repo_id": "tollgate-nostr-daemon"},
+    "OpenTollGate/fips-exit-e2e": {"ngit_repo_id": "fips-exit-e2e"},
+    "OpenTollGate/fips-exit-node": {"ngit_repo_id": "fips-exit-node"},
+    "OpenTollGate/tollgate-installer": {},
+    "PlebeianApp/market": {"ngit_repo_id": "market"},
+    "FreedomTechFeed/feed": {"ngit_repo_id": "feed"},
+    "FreedomTechFeed/packages": {"ngit_repo_id": "packages"},
+    "felixfelix-bot/gh-ngit-ci-bridge": {"ngit_repo_id": "gh-ngit-ci-bridge"},
+    "felixfelix-bot/market": {},
+    "felixfelix-bot/MeshCore": {},
+    "felixfelix-bot/microfips": {"ngit_repo_id": "microfips"},
+    "felixfelix-bot/tollgate-installer": {},
+    "felixfelix-bot/tollgate-android": {},
+    "felixfelix-bot/auditable-voting": {},
+    "felixfelix-bot/hermes-agent": {},
+    "felixfelix-bot/hermes-bot": {},
+    "felixfelix-bot/tunnelsats-startos": {},
+    "c03rad0r/MeshCore": {},
+    "Amperstrand/bolty-rs": {},
+    "Amperstrand/cashu-audit": {},
+    "Amperstrand/gm65-scanner": {},
+    "Amperstrand/lightning": {},
+    "Amperstrand/shc-toolkit": {},
+    "Amperstrand/terraform-provider-shc": {},
+    "Amperstrand/tollgate-module-basic-go": {},
+    "Origami74/fips-deployments": {},
+    "Origami74/myco": {},
+    "Origami74/pyramid": {},
+    "maxime-tt/market": {},
+    "net4sats/tollgate-module-basic-go": {}
+  }
+}

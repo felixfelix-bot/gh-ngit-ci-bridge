@@ -1,0 +1,33 @@
+name: bridge-smoke
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Say hello from ngit CI
+        run: |
+          set -eu
+          echo "gh-ngit-ci-bridge smoke workflow running"
+          ls -l bridge.py decision.py
+      - name: Decision self-check
+        run: |
+          set -eu
+          python3 - <<'PY'
+          import sys
+          sys.path.insert(0, '.')
+          from decision import Commit, RepoSpec, decide, MIRROR_PUSH
+          d = decide(
+              Commit(sha='0'*40, branch='main', author_login='felixfelix-bot'),
+              RepoSpec(slug='o/r', ngit_repo_id='r', ngit_owner_hex='ab'*32, workflows=()),
+              seen_shas=[], watched=['felixfelix-bot'],
+          )
+          assert d.action == MIRROR_PUSH, d
+          print('decision logic ok:', d.as_log_line('0'*40))
+          PY

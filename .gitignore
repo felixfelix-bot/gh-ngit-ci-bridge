@@ -1,0 +1,13 @@
+# secrets / local state
+state.json
+state.json.tmp
+lock
+*.log
+.env
+.nsec
+*.key
+
+# python
+__pycache__/
+*.pyc
+.pytest_cache/
