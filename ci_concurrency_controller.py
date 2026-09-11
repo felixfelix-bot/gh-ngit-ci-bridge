@@ -102,7 +102,10 @@ awk '/MemAvailable:/{print $2}' /proc/meminfo 2>/dev/null
 echo "===PS==="
 docker compose ps --format '{{.Name}}|{{.State}}|{{.Status}}' 2>&1
 echo "===LOGS==="
-docker compose logs --tail=800 coordinator 2>&1
+# 3000 lines reaches hours back on this coordinator; the job-lifecycle lines are
+# sparse relative to relay/watchdog chatter, so a small window could miss the
+# last job entirely.
+docker compose logs --tail=3000 coordinator 2>&1
 echo "===ACT==="
 names=$(docker compose exec -T dind docker ps -a --format '{{.Names}}' 2>/dev/null | grep '^act-' || true)
 for n in $names; do
@@ -151,6 +154,8 @@ class Dq05State:
     log_text: str = ""
     act_containers: list[dict] = field(default_factory=list)
     queue_text: str = ""
+    log_lines: int = 0
+    log_truncated: bool = False
 
     def parse_ps(self) -> dict[str, str]:
         out: dict[str, str] = {}
@@ -196,6 +201,8 @@ def probe_dq05(ssh_target: str, timeout: int = 90) -> Dq05State:
             state.mem_available_mb = None
     state.compose_ps = sec.get("PS", "")
     state.log_text = sec.get("LOGS", "")
+    state.log_lines = len(state.log_text.splitlines())
+    state.log_truncated = state.log_lines >= 3000
     state.queue_text = (sec.get("QUEUE", "") or "").strip()
     for line in (sec.get("ACT", "") or "").splitlines():
         parts = line.split("|")
@@ -572,6 +579,15 @@ def build_argparser() -> argparse.ArgumentParser:
         ),
     )
     ap.add_argument(
+        "--max-job-age-s",
+        type=float,
+        default=float(os.environ.get("KALMAN_CI_MAX_JOB_AGE_S", 2100.0)),
+        help=(
+            "an act job container older than this is an orphan, not a live job "
+            "(default 2100s = the coordinator's 1800s job timeout + margin)"
+        ),
+    )
+    ap.add_argument(
         "--dimensions",
         default=os.environ.get("KALMAN_CI_DIMENSIONS", ""),
         help=(
@@ -677,7 +693,11 @@ def main(argv: list[str] | None = None) -> int:
         )
     else:
         idle, idle_detail, idle_facts = classify_idle(
-            dq.log_text, dq.act_containers, now=now, log_readable=True
+            dq.log_text,
+            dq.act_containers,
+            now=now,
+            max_job_age_s=args.max_job_age_s,
+            log_readable=True,
         )
         decision = decide(
             signal=signal,
@@ -698,6 +718,8 @@ def main(argv: list[str] | None = None) -> int:
         extra["dq05"] = {
             "compose_ps": dq.compose_ps.strip().replace("\n", "; "),
             "queued_jobs_present": bool(dq.queue_text),
+            "coordinator_log_lines": dq.log_lines,
+            "coordinator_log_truncated": dq.log_truncated,
             "act_containers_seen": [
                 {"name": c["name"][:60], "running": c["running"]} for c in dq.act_containers
             ],
@@ -729,7 +751,10 @@ def main(argv: list[str] | None = None) -> int:
             record.reason = f"{record.reason}; re-check before apply failed: {recheck.error}"
         else:
             idle2, idle2_detail, _ = classify_idle(
-                recheck.log_text, recheck.act_containers, now=time.time()
+                recheck.log_text,
+                recheck.act_containers,
+                now=time.time(),
+                max_job_age_s=args.max_job_age_s,
             )
             if not idle2 and not args.force_recreate:
                 apply_detail = f"aborted at re-check: {idle2_detail}"

@@ -217,10 +217,30 @@ def test_idle_is_false_while_a_job_is_in_flight():
 
 
 def test_idle_is_false_for_a_freshly_started_act_container():
-    fresh = [{"name": "act-Build-Test-1", "running": True, "started": time.time() - 3}]
-    idle, reason, _ = cc.classify_idle(LOG_IDLE, fresh, now=time.time())
+    now = time.time()
+    fresh = [{"name": "act-Build-Test-1", "running": True, "started": now - 3}]
+    idle, reason, _ = cc.classify_idle(LOG_IDLE, fresh, now=now)
     assert idle is False
     assert "act job container" in reason
+
+
+def test_a_running_act_container_inside_the_job_timeout_counts_as_busy():
+    now = time.time()
+    # 25 min in: the coordinator's own job timeout is 30 min, so this can be a
+    # live job -> must defer, even with a log window that shows no lifecycle.
+    mid = [{"name": "act-Build-Test-2", "running": True, "started": now - 25 * 60}]
+    idle, reason, _ = cc.classify_idle(LOG_IDLE, mid, now=now)
+    assert idle is False, reason
+
+
+def test_an_orphan_act_container_past_the_job_timeout_is_ignored():
+    now = time.time()
+    # 45 min in: the coordinator kills jobs at 30 min, so this is an orphan act
+    # never cleaned up. Treating it as busy would deadlock the controller.
+    orphan = [{"name": "act-Test-and-Build-3", "running": True, "started": now - 45 * 60}]
+    idle, reason, facts = cc.classify_idle(LOG_IDLE, orphan, now=now)
+    assert idle is True, reason
+    assert facts["stale_act_containers"]
 
 
 def test_idle_is_false_for_an_enqueue_that_has_not_completed_yet():

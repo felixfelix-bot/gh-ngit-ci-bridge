@@ -397,9 +397,13 @@ _ACT_NAME_RE = re.compile(r"^act-")
 #: "Enqueued" and the act container appearing.
 ENQUEUE_GRACE_S = 30.0
 
-#: A running act-* container younger than this is treated as an active job even
-#: if the coordinator log has not caught up yet.
-FRESH_CONTAINER_GRACE_S = 60.0
+#: An act-* container that has been running longer than this cannot be an
+#: active job: the coordinator logs ``job_timeout_secs=1800`` (30 min) and kills
+#: jobs past it, so anything older is an orphan (act left one behind in
+#: production: ``act-Test-and-Build-... Up 2 hours`` long after its run
+#: completed). This is a *timeout-based* proof of staleness, so it does not
+#: depend on how far back the fetched log window reaches.
+MAX_JOB_AGE_S = 2100.0  # 35 min = coordinator job timeout (1800s) + margin
 
 
 def _parse_ts(text: str) -> float | None:
@@ -454,12 +458,21 @@ def classify_idle(
     *,
     now: float | None = None,
     enqueue_grace_s: float = ENQUEUE_GRACE_S,
-    fresh_container_grace_s: float = FRESH_CONTAINER_GRACE_S,
+    max_job_age_s: float = MAX_JOB_AGE_S,
     log_readable: bool = True,
 ) -> tuple[bool, str, dict]:
     """Decide whether the coordinator is provably idle.
 
     ``act_containers`` items: ``{"name": str, "running": bool, "started": float|None}``.
+
+    Two independent proofs, because either source can be incomplete:
+
+    * the coordinator log gives started/completed trigger pairs (an unmatched
+      start is an in-flight job) and fresh enqueues;
+    * the dind daemon gives live ``act-*`` job containers. A container is only
+      dismissed as an orphan when it is older than the coordinator's own job
+      timeout (``max_job_age_s``) — so a truncated log window can never hide a
+      live job.
 
     Fail-closed: anything we cannot prove is "not idle". Returns
     ``(idle, reason, facts)``.
@@ -502,18 +515,21 @@ def classify_idle(
             continue
         started = c.get("started")
         running = bool(c.get("running"))
-        # A container that started after the last completed job, or one that is
-        # still within the grace window, is treated as an in-flight job.
-        if last_completed is not None and started is not None and started > last_completed:
-            live.append((name, started))
-        elif started is None or (now - started) < fresh_container_grace_s:
+        age = None if started is None else now - started
+        # LIVE while it is younger than the coordinator's job timeout; only an
+        # older container is provably an orphan act never cleaned up.
+        if age is None or age < max_job_age_s:
             live.append((name, started))
         elif running:
-            facts.setdefault("stale_act_containers", []).append(name)
+            facts.setdefault("stale_act_containers", []).append(
+                {"name": name, "age_s": None if age is None else round(age, 1)}
+            )
 
     if live:
-        names = ",".join(n[:48] for n, _ in live[:3])
-        return False, f"act job container(s) present ({names})", facts
+        ages = ", ".join(
+            f"{n[:40]} age={'' if s is None else f'{now - s:.0f}s'}" for n, s in live[:3]
+        )
+        return False, f"act job container(s) present ({ages})", facts
 
     if parsed["started"] == 0 and parsed["completed"] == 0:
         facts["no_job_history"] = True
