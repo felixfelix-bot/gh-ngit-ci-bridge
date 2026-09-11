@@ -51,6 +51,8 @@ hard floor on the *observed* DQ05 memory (a safety clamp, not a predictor).
 
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 import re
 from dataclasses import dataclass, field
@@ -387,6 +389,18 @@ def decide(
 _START_RE = re.compile(r"Starting queued CI job trigger_event=([0-9a-fA-F]+)")
 _DONE_RE = re.compile(r"Completed embedded CI for trigger trigger_event=([0-9a-fA-F]+)")
 _ENQUEUE_RE = re.compile(r"Enqueued CI job trigger_event=([0-9a-fA-F]+)")
+#: Anything that means "the coordinator took (or considered) new work": a repo
+#: event being planned, a job being enqueued/started/completed, a trigger being
+#: skipped. These are the lines the fence compares between its samples.
+_ACTIVITY_RE = re.compile(
+    r"(Planning CI for "
+    r"|Enqueued CI job trigger_event="
+    r"|Starting queued CI job trigger_event="
+    r"|Completed embedded CI for trigger trigger_event="
+    r"|Completed CI run repo="
+    r"|Skipping stale PR trigger event)"
+)
+_PLAN_RE = re.compile(r"Planning CI for ")
 # The timestamp is the FIRST RFC3339 field in the line: `docker compose logs`
 # prefixes each line with "<service>-1  | " before the message's own timestamp.
 _TS_RE = re.compile(r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?)")
@@ -404,6 +418,27 @@ ENQUEUE_GRACE_S = 30.0
 #: completed). This is a *timeout-based* proof of staleness, so it does not
 #: depend on how far back the fetched log window reaches.
 MAX_JOB_AGE_S = 2100.0  # 35 min = coordinator job timeout (1800s) + margin
+
+#: Length of the quiet window the recreate fence demands: the coordinator must
+#: be provably idle at BOTH ends of it, with no new trigger/repo-event/queue log
+#: line, no change in the live act-container set and no queued job in between.
+#: One time-based sample is not a fence; a window is (the sampling interval of
+#: the timer that runs this is 5 min, so 90 s of quiet still leaves plenty of
+#: room to act).
+DEFAULT_SETTLE_S = 90.0
+
+#: ``docker stop`` timeout used by the drain-safe apply. The coordinator handles
+#: SIGTERM as a *graceful drain* (finishes running jobs, freezes unstarted ones
+#: into a queue checkpoint), and its own ``stop_grace_period`` in
+#: ``docker-compose.yml`` is 33 min = 30 min job timeout + 2 min Blossom budget
+#: + overhead. Matching it here means the apply never SIGKILLs a live job.
+DEFAULT_STOP_GRACE_S = 1980.0
+
+#: ngit-ci recovers a frozen queue checkpoint only while it is younger than
+#: ``NGIT_CI_QUEUE_RECOVERY_WINDOW_SECS`` (600s by default); an older checkpoint
+#: is discarded on start, so its jobs are no longer queued and must not block a
+#: change forever.
+DEFAULT_RECOVERY_WINDOW_S = 600.0
 
 
 def _parse_ts(text: str) -> float | None:
@@ -425,9 +460,22 @@ def parse_coordinator_log(text: str) -> dict:
     completed: set[str] = set()
     enqueued: list[tuple[str, float | None]] = []
     last_completed_ts: float | None = None
+    planned = 0
+    newest_activity_ts: float | None = None
+    lifecycle_hashes: set[str] = set()
 
     for line in text.splitlines():
         ts = _parse_ts(line)
+        if _ACTIVITY_RE.search(line):
+            # Identity of this *instance* of a trigger/repo-event/queue line, so
+            # the fence can tell "nothing new happened" from "a new line
+            # appeared" even when the log window rolls over: identical lines
+            # hash identically, a new event/sample does not.
+            lifecycle_hashes.add(hashlib.sha1(line.strip().encode()).hexdigest()[:16])
+            if _PLAN_RE.search(line):
+                planned += 1
+            if ts is not None and (newest_activity_ts is None or ts > newest_activity_ts):
+                newest_activity_ts = ts
         m = _START_RE.search(line)
         if m:
             started[m.group(1)] = ts
@@ -449,7 +497,56 @@ def parse_coordinator_log(text: str) -> dict:
         "in_flight": in_flight,
         "last_completed_ts": last_completed_ts,
         "last_enqueue_ts": max((ts for _, ts in enqueued if ts is not None), default=None),
+        "planned": planned,
+        "enqueued": len(enqueued),
+        "newest_activity_ts": newest_activity_ts,
+        "lifecycle_hashes": frozenset(lifecycle_hashes),
     }
+
+
+def orphan_policy_text(max_job_age_s: float = MAX_JOB_AGE_S) -> str:
+    """The orphan policy, in one line, as it is written to the decision log.
+
+    An ``act-*`` container is only *provably* an orphan when it is older than
+    the coordinator's own job timeout (1800s) plus a margin: the coordinator
+    kills jobs past that timeout, so nothing it still tracks can be that old.
+    An orphan is REPORTED (``fence.orphans``) and never blocks the change — the
+    controller must not deadlock on a leaked container act never cleaned up
+    (production had one: ``act-Test-and-Build-... Up 2 hours``). A container
+    younger than the cutoff, or with an unparseable start time, is treated as a
+    LIVE job and defers the change (fail closed).
+    """
+    return (
+        f"act-* older than {max_job_age_s:.0f}s (job timeout 1800s + margin) = "
+        "orphan: reported in fence.orphans, never blocks and is never mistaken "
+        "for an active job; younger or unknown age = live job -> defer"
+    )
+
+
+def split_act_containers(
+    act_containers: Sequence[Mapping],
+    *,
+    now: float,
+    max_job_age_s: float = MAX_JOB_AGE_S,
+) -> tuple[list[tuple[str, float | None]], list[tuple[str, float | None]]]:
+    """Split ``act-*`` containers into (live, orphans).
+
+    Returned tuples are ``(name, age_s)``; ``age_s`` is ``None`` when the start
+    time could not be parsed (which counts as LIVE — fail closed).
+    """
+    live: list[tuple[str, float | None]] = []
+    orphans: list[tuple[str, float | None]] = []
+    for c in act_containers:
+        name = str(c.get("name", ""))
+        if not _ACT_NAME_RE.match(name):
+            continue
+        started = c.get("started")
+        age = None if started is None else now - started
+        if age is None or age < max_job_age_s:
+            live.append((name, age))
+        else:
+            orphans.append((name, age))
+    return live, orphans
 
 
 def classify_idle(
@@ -460,6 +557,8 @@ def classify_idle(
     enqueue_grace_s: float = ENQUEUE_GRACE_S,
     max_job_age_s: float = MAX_JOB_AGE_S,
     log_readable: bool = True,
+    queued_jobs: int = 0,
+    queued_detail: str = "",
 ) -> tuple[bool, str, dict]:
     """Decide whether the coordinator is provably idle.
 
@@ -488,8 +587,19 @@ def classify_idle(
     if not log_text.strip():
         return False, "coordinator log empty — cannot prove idle", facts
 
+    if queued_jobs > 0:
+        facts["queued_jobs"] = int(queued_jobs)
+        detail = queued_detail or "queue checkpoint not empty"
+        return False, f"{int(queued_jobs)} queued job(s) not started yet ({detail})", facts
+
     parsed = parse_coordinator_log(log_text)
-    facts.update({k: v for k, v in parsed.items() if k != "last_enqueue_ts"})
+    facts.update(
+        {
+            k: v
+            for k, v in parsed.items()
+            if k not in ("last_enqueue_ts", "lifecycle_hashes")
+        }
+    )
     last_completed = parsed["last_completed_ts"]
     if last_completed is not None:
         facts["last_completed_age_s"] = round(now - last_completed, 1)
@@ -508,27 +618,16 @@ def classify_idle(
                 facts,
             )
 
-    live: list[tuple[str, float | None]] = []
-    for c in act_containers:
-        name = str(c.get("name", ""))
-        if not _ACT_NAME_RE.match(name):
-            continue
-        started = c.get("started")
-        running = bool(c.get("running"))
-        age = None if started is None else now - started
-        # LIVE while it is younger than the coordinator's job timeout; only an
-        # older container is provably an orphan act never cleaned up.
-        if age is None or age < max_job_age_s:
-            live.append((name, started))
-        elif running:
-            facts.setdefault("stale_act_containers", []).append(
-                {"name": name, "age_s": None if age is None else round(age, 1)}
-            )
+    live, orphans = split_act_containers(act_containers, now=now, max_job_age_s=max_job_age_s)
+    if orphans:
+        facts["stale_act_containers"] = [
+            {"name": name, "age_s": None if age is None else round(age, 1)}
+            for name, age in orphans
+        ]
+        facts["orphan_policy"] = orphan_policy_text(max_job_age_s)
 
     if live:
-        ages = ", ".join(
-            f"{n[:40]} age={'' if s is None else f'{now - s:.0f}s'}" for n, s in live[:3]
-        )
+        ages = ", ".join(f"{n[:40]} age={'' if a is None else f'{a:.0f}s'}" for n, a in live[:3])
         return False, f"act job container(s) present ({ages})", facts
 
     if parsed["started"] == 0 and parsed["completed"] == 0:
@@ -539,6 +638,162 @@ def classify_idle(
         f"no in-flight trigger, no live act container"
     )
     return True, detail, facts
+
+
+# --------------------------------------------------------------- queue state
+
+
+def parse_queued_jobs(
+    text: str,
+    *,
+    now: float | None = None,
+    recovery_window_s: float = DEFAULT_RECOVERY_WINDOW_S,
+) -> tuple[int, str]:
+    """Count unstarted jobs in the coordinator's queue checkpoint.
+
+    ngit-ci writes ``/data/queued-jobs.json`` (``NGIT_CI_QUEUE_STATE_PATH``)
+    when it freezes unstarted jobs during a graceful drain, and removes the file
+    as soon as the queue is empty. It only *recovers* a checkpoint younger than
+    ``NGIT_CI_QUEUE_RECOVERY_WINDOW_SECS`` (600s): an older one is discarded on
+    start, so those jobs are not queued any more and must not block a change
+    forever. Returns ``(count, detail)``.
+    """
+    import time as _time
+
+    raw = (text or "").strip()
+    if not raw:
+        return 0, "no queue checkpoint (queue empty)"
+    try:
+        data = json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        return 0, "queue checkpoint unreadable (not JSON) — treated as empty"
+    if not isinstance(data, dict):
+        return 0, "queue checkpoint is not an object — treated as empty"
+    jobs = data.get("jobs")
+    if not isinstance(jobs, list) or not jobs:
+        return 0, "queue checkpoint carries no jobs"
+    suspended = data.get("suspended_at")
+    now = _time.time() if now is None else now
+    if isinstance(suspended, (int, float)) and not isinstance(suspended, bool):
+        age = now - float(suspended)
+        if age > recovery_window_s:
+            return 0, (
+                f"queue checkpoint is stale ({age:.0f}s > recovery window "
+                f"{recovery_window_s:.0f}s) — ngit-ci discards it on start"
+            )
+        return len(jobs), f"{len(jobs)} job(s) frozen {age:.0f}s ago"
+    return len(jobs), f"{len(jobs)} job(s) frozen (no timestamp in the checkpoint)"
+
+
+# -------------------------------------------------------------- quiet fence
+
+
+@dataclass(frozen=True)
+class JobActivity:
+    """One sample of everything that says "the coordinator did (or could do) work".
+
+    Two samples are compared by :func:`new_activity`; the comparison is what
+    turns a single idle *sample* into a quiet *window*.
+    """
+
+    planned: int = 0
+    enqueued: int = 0
+    started: int = 0
+    completed: int = 0
+    in_flight: tuple[str, ...] = ()
+    newest_activity_ts: float | None = None
+    lifecycle_hashes: frozenset[str] = frozenset()
+    live_act: tuple[str, ...] = ()
+    orphans: tuple[tuple[str, float | None], ...] = ()
+    queued_jobs: int = 0
+    log_lines: int = 0
+    log_truncated: bool = False
+
+    def as_dict(self) -> dict:
+        return {
+            "planned": self.planned,
+            "enqueued": self.enqueued,
+            "started": self.started,
+            "completed": self.completed,
+            "in_flight": list(self.in_flight),
+            "newest_activity_ts": self.newest_activity_ts,
+            "live_act_containers": list(self.live_act),
+            "orphans": [
+                {"name": n, "age_s": None if a is None else round(a, 1)}
+                for n, a in self.orphans
+            ],
+            "queued_jobs": self.queued_jobs,
+            "log_lines": self.log_lines,
+            "log_window_truncated": self.log_truncated,
+        }
+
+
+def fingerprint_jobs(
+    log_text: str,
+    act_containers: Sequence[Mapping] = (),
+    *,
+    now: float,
+    max_job_age_s: float = MAX_JOB_AGE_S,
+    queued_jobs: int = 0,
+    log_lines: int | None = None,
+    log_truncated: bool = False,
+) -> JobActivity:
+    """Build one comparable sample of job activity from the probe's evidence."""
+    parsed = parse_coordinator_log(log_text)
+    live, orphans = split_act_containers(act_containers, now=now, max_job_age_s=max_job_age_s)
+    return JobActivity(
+        planned=parsed["planned"],
+        enqueued=parsed["enqueued"],
+        started=parsed["started"],
+        completed=parsed["completed"],
+        in_flight=tuple(parsed["in_flight"]),
+        newest_activity_ts=parsed["newest_activity_ts"],
+        lifecycle_hashes=frozenset(parsed["lifecycle_hashes"]),
+        live_act=tuple(sorted(n for n, _ in live)),
+        orphans=tuple(sorted(orphans, key=lambda item: item[0])),
+        queued_jobs=int(queued_jobs),
+        log_lines=int(log_lines if log_lines is not None else len(log_text.splitlines())),
+        log_truncated=bool(log_truncated),
+    )
+
+
+def new_activity(previous: JobActivity, current: JobActivity) -> tuple[bool, str]:
+    """Did anything job-relevant happen between two samples?
+
+    A *new* trigger/repo-event/queue line is the primary witness (line
+    identities, so a log window that simply rolled over is not mistaken for
+    activity). The live act-container set, the in-flight trigger set and the
+    queue checkpoint are checked independently, because any one of them can be
+    complete while another is not. Fail closed: anything that changed is
+    reported as activity.
+    """
+    reasons: list[str] = []
+    fresh = current.lifecycle_hashes - previous.lifecycle_hashes
+    if fresh:
+        reasons.append(f"{len(fresh)} new trigger/repo-event/queue log line(s)")
+    if current.in_flight != previous.in_flight:
+        reasons.append(
+            f"in-flight triggers changed {list(previous.in_flight)[:3]} -> "
+            f"{list(current.in_flight)[:3]}"
+        )
+    if current.live_act != previous.live_act:
+        reasons.append(
+            f"live act containers changed {list(previous.live_act)} -> {list(current.live_act)}"
+        )
+    if current.queued_jobs != previous.queued_jobs:
+        reasons.append(f"queued jobs changed {previous.queued_jobs} -> {current.queued_jobs}")
+    if (
+        previous.newest_activity_ts is not None
+        and current.newest_activity_ts is not None
+        and current.newest_activity_ts > previous.newest_activity_ts
+        and not fresh
+    ):
+        # Same line identities but a later timestamp: the window rolled forward
+        # without new work. Recorded, not fatal — but if the window shrank we
+        # cannot prove quiet either.
+        if current.log_lines < previous.log_lines:
+            reasons.append("log window rolled over (shrank) during the settle window")
+    return bool(reasons), "; ".join(reasons)
 
 
 # --------------------------------------------------------------- env patching

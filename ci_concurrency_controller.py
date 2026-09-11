@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import fcntl
 import json
 import os
 import subprocess
@@ -43,14 +44,21 @@ from ci_concurrency import (  # noqa: E402
     DEFAULT_DQ05_MEM_FLOOR_MB,
     DEFAULT_MAX_LIMIT,
     DEFAULT_MAX_SIGNAL_AGE_S,
+    DEFAULT_RECOVERY_WINDOW_S,
+    DEFAULT_SETTLE_S,
     DEFAULT_SIGNAL_CEILING,
+    DEFAULT_STOP_GRACE_S,
     Decision,
     LogRecord,
     Signal,
     classify_idle,
     decide,
+    fingerprint_jobs,
+    new_activity,
+    orphan_policy_text,
     parse_env_value,
     parse_kv_state,
+    parse_queued_jobs,
     patch_env_value,
 )
 
@@ -85,11 +93,61 @@ DEFAULT_SIGNAL_SOURCES = (
 DEFAULT_CAPACITY_PROBE = "~/.hermes/profiles/manager/scripts/compute_max_workers.py"
 DEFAULT_OVERRIDE_FILE = "~/.local/state/gh-ngit-ci-bridge/ci-concurrency.override"
 DEFAULT_LOG_FILE = "~/.local/state/gh-ngit-ci-bridge/ci-concurrency.log"
+DEFAULT_LOCK_FILE = "~/.local/state/gh-ngit-ci-bridge/ci-concurrency.lock"
 DEFAULT_SSH_TARGET = "dq05"
 DEFAULT_DEPLOY_DIR = "~/ngit-ci-deploy"
 ENV_KEY = "NGIT_CI_MAX_CONCURRENT_JOBS"
 
-MARK = {ACTION_APPLY: "APPLY", ACTION_NOOP: "NOOP", ACTION_DEFER: "DEFER", ACTION_DRY_RUN: "DRY-RUN"}
+#: Exit code for "another controller tick holds the lock". Same convention (and
+#: same meaning) as gh-ngit-ci-bridge's own EXIT_LOCKED, so both units can list
+#: it in SuccessExitStatus.
+EXIT_LOCKED = 3
+ACTION_LOCK_HELD = "lock_held"
+
+MARK = {
+    ACTION_APPLY: "APPLY",
+    ACTION_NOOP: "NOOP",
+    ACTION_DEFER: "DEFER",
+    ACTION_DRY_RUN: "DRY-RUN",
+    ACTION_LOCK_HELD: "LOCK-HELD",
+}
+
+#: Indirection so tests can drive the settle window without sleeping through it.
+SETTLE_SLEEP = time.sleep
+
+
+class TickLock:
+    """Exclusive single-flight lock over the controller's state directory.
+
+    The 5-minute timer and a manual ``make concurrency-once`` must never
+    overlap: two ticks could each observe "idle", each decide to apply a
+    *different* limit, and each recreate the coordinator — the second one
+    killing whatever the first had just started. ``flock`` is released by the
+    kernel when the process dies, so a crashed tick cannot wedge the controller.
+    """
+
+    def __init__(self, path: str | Path):
+        self.path = Path(os.path.expanduser(str(path)))
+        self.handle = None
+
+    def __enter__(self) -> "TickLock":
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        handle = self.path.open("w")
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except (BlockingIOError, OSError):
+            handle.close()
+            raise BlockingIOError(f"another tick holds {self.path}")
+        self.handle = handle
+        return self
+
+    def __exit__(self, *exc) -> None:
+        if self.handle is not None:
+            try:
+                fcntl.flock(self.handle, fcntl.LOCK_UN)
+            finally:
+                self.handle.close()
+                self.handle = None
 
 # ------------------------------------------------------------------ ssh probe
 
@@ -230,14 +288,45 @@ sed -i "s/^NGIT_CI_MAX_CONCURRENT_JOBS=.*/NGIT_CI_MAX_CONCURRENT_JOBS=__LIMIT__/
 chmod 600 .env
 echo "ENV_NOW=$(grep '^NGIT_CI_MAX_CONCURRENT_JOBS=' .env)"
 echo "BACKUP=.env.bak.$ts"
+# Drain-safe restart. `docker compose stop` sends SIGTERM and WAITS, and the
+# coordinator treats SIGTERM as a graceful drain: it freezes intake, finishes
+# every in-flight job, checkpoints unstarted ones, and only then exits. The
+# timeout below matches the coordinator's own `stop_grace_period` (33m), so a
+# job that starts between the controller's last sample and this stop is drained
+# to completion instead of being killed by the recreate (which is what
+# `docker compose up -d` alone does, at whatever stop timeout it picks).
+s=$(date +%s)
+docker compose stop -t __GRACE__ coordinator 2>&1 | tail -3
+echo "STOP_TOOK_S=$(( $(date +%s) - s ))"
+# The stopped container still holds the log of the shutdown we just triggered;
+# read it back so the decision log can carry proof that the drain happened.
+echo "DRAIN_TAIL:"
+docker compose logs --tail=8 coordinator 2>&1 | sed 's/^/  /'
 docker compose up -d coordinator 2>&1 | tail -6
+# The value that matters is the one inside the running process, not the one in
+# the file: verify both.
+echo "RUNTIME_VALUE=$(docker compose exec -T coordinator printenv NGIT_CI_MAX_CONCURRENT_JOBS < /dev/null 2>/dev/null || echo UNKNOWN)"
 echo "PS_AFTER:"
 docker compose ps --format '{{.Name}}|{{.State}}|{{.Status}}' 2>&1
 """
 
 
-def apply_limit(ssh_target: str, limit: int, timeout: int = 240) -> tuple[bool, str]:
-    script = APPLY_SCRIPT.replace("__LIMIT__", str(int(limit)))
+def apply_limit(
+    ssh_target: str,
+    limit: int,
+    timeout: int | None = None,
+    *,
+    stop_grace_s: float = DEFAULT_STOP_GRACE_S,
+) -> tuple[bool, str]:
+    """Apply ``limit`` and recreate the coordinator without killing a job.
+
+    The ssh timeout is derived from the stop grace period: a drain that waits
+    for a full 30-minute job is a success, not a timeout.
+    """
+    grace = int(max(1.0, float(stop_grace_s)))
+    if timeout is None:
+        timeout = int(grace + 180)
+    script = APPLY_SCRIPT.replace("__LIMIT__", str(int(limit))).replace("__GRACE__", str(grace))
     try:
         proc = subprocess.run(
             ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", ssh_target, "bash", "-s"],
@@ -559,6 +648,36 @@ def build_argparser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--dry-run", action="store_true", help="decide + log, apply nothing")
     ap.add_argument("--force-recreate", action="store_true", help="skip the idle check (dangerous)")
+    ap.add_argument(
+        "--settle-s",
+        type=float,
+        default=float(os.environ.get("KALMAN_CI_SETTLE_S", DEFAULT_SETTLE_S)),
+        help=(
+            "quiet window (seconds) the coordinator must be observably idle across "
+            "before a recreate: two idle samples with no new trigger/repo-event/queue "
+            "line, no change in the live act-container set and no queued job in "
+            "between (default 90s; 0 disables the wait, not the comparison)"
+        ),
+    )
+    ap.add_argument(
+        "--stop-grace-s",
+        type=float,
+        default=float(os.environ.get("KALMAN_CI_STOP_GRACE_S", DEFAULT_STOP_GRACE_S)),
+        help=(
+            "docker stop timeout for the drain-safe apply; the coordinator drains "
+            "in-flight jobs on SIGTERM (default 1980s = its own stop_grace_period)"
+        ),
+    )
+    ap.add_argument(
+        "--recovery-window-s",
+        type=float,
+        default=float(os.environ.get("KALMAN_CI_RECOVERY_WINDOW_S", DEFAULT_RECOVERY_WINDOW_S)),
+        help=(
+            "ngit-ci's NGIT_CI_QUEUE_RECOVERY_WINDOW_SECS: a queue checkpoint older "
+            "than this is discarded on start and no longer counts as queued work"
+        ),
+    )
+    ap.add_argument("--lock-file", default=DEFAULT_LOCK_FILE)
     ap.add_argument("--override", type=int, default=None, help="pin the limit for this tick")
     ap.add_argument("--state-file", default=None, help="pin one signal file (default: freshest of --signal-sources)")
     ap.add_argument("--fallback-state-file", default=DEFAULT_FALLBACK_STATE)
@@ -632,10 +751,46 @@ def write_log(log_file: Path, record: dict) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """CLI entry point: single-flight lock, then exactly one tick."""
     args = build_argparser().parse_args(argv)
     log_file = Path(os.path.expanduser(args.log_file))
     now = time.time()
 
+    if args.dry_run:
+        # A dry run mutates nothing, so it does not need the lock (and must not
+        # be blocked by a real tick sitting in its settle window).
+        return _run_tick(args, log_file, now)
+
+    # (a) mutual exclusion. The timer and a manual `make concurrency-once` must
+    # never overlap: two ticks could each see "idle", each pick a different
+    # limit, and the second recreate could kill what the first just started.
+    lock = TickLock(args.lock_file)
+    try:
+        lock.__enter__()
+    except BlockingIOError as exc:
+        record = LogRecord(
+            ts=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)),
+            signal={},
+            computed_limit=0,
+            previous_limit=None,
+            action=ACTION_LOCK_HELD,
+            reason=f"another tick holds the lock ({exc}); not proceeding",
+            idle=None,
+            idle_detail="",
+            extra={"lock_file": str(Path(os.path.expanduser(args.lock_file)))},
+        )
+        write_log(log_file, record.as_dict())
+        if not args.quiet:
+            print(f"[LOCK-HELD] another tick holds the lock; exiting (see {log_file})")
+        return EXIT_LOCKED
+
+    try:
+        return _run_tick(args, log_file, now)
+    finally:
+        lock.__exit__(None, None, None)
+
+
+def _run_tick(args, log_file: Path, now: float) -> int:
     signal_notes: list[str] = []
     try:
         if args.state_file:
@@ -678,6 +833,54 @@ def main(argv: list[str] | None = None) -> int:
     dims = [d.strip() for d in str(args.dimensions).split(",") if d.strip()] or None
 
     dq = probe_dq05(args.ssh_target)
+
+    # The quiet-window fence's ledger: every field here is written to the
+    # decision log, so a deferred tick says exactly what it saw and why it
+    # refused to restart the coordinator.
+    fence: dict = {
+        "settle_s": max(0.0, float(args.settle_s)),
+        "stop_grace_s": float(args.stop_grace_s),
+        "recovery_window_s": float(args.recovery_window_s),
+        "samples": 0,
+        "sample_1": None,
+        "sample_2": None,
+        "sample_3": None,
+        "changed": False,
+        "change_reason": "",
+        "pre_apply_recheck": {"changed": False, "reason": ""},
+        "orphan_policy": orphan_policy_text(args.max_job_age_s),
+        "orphans": [],
+        "defer_reason": "",
+        "bypassed": "",
+    }
+    act1 = None
+
+    def sample(state):
+        """One fence sample: job-activity fingerprint + queue facts + idle verdict."""
+        sampled_at = time.time()
+        queued, queued_detail = parse_queued_jobs(
+            state.queue_text, now=sampled_at, recovery_window_s=args.recovery_window_s
+        )
+        activity = fingerprint_jobs(
+            state.log_text,
+            state.act_containers,
+            now=sampled_at,
+            max_job_age_s=args.max_job_age_s,
+            queued_jobs=queued,
+            log_lines=state.log_lines,
+            log_truncated=state.log_truncated,
+        )
+        verdict = classify_idle(
+            state.log_text,
+            state.act_containers,
+            now=sampled_at,
+            max_job_age_s=args.max_job_age_s,
+            log_readable=True,
+            queued_jobs=queued,
+            queued_detail=queued_detail,
+        )
+        return activity, verdict
+
     if not dq.reachable:
         decision = decide(
             signal=signal,
@@ -696,13 +899,10 @@ def main(argv: list[str] | None = None) -> int:
             decision, reason=f"DQ05 unreachable: {dq.error}"
         )
     else:
-        idle, idle_detail, idle_facts = classify_idle(
-            dq.log_text,
-            dq.act_containers,
-            now=now,
-            max_job_age_s=args.max_job_age_s,
-            log_readable=True,
-        )
+        act1, (idle, idle_detail, _idle_facts) = sample(dq)
+        fence["samples"] = 1
+        fence["sample_1"] = act1.as_dict()
+        fence["orphans"] = act1.as_dict()["orphans"]
         decision = decide(
             signal=signal,
             previous=dq.env_value,
@@ -730,6 +930,7 @@ def main(argv: list[str] | None = None) -> int:
         }
     if override_note:
         extra["override_note"] = override_note
+    extra["fence"] = fence
 
     record = LogRecord(
         ts=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)),
@@ -746,44 +947,127 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     apply_detail = ""
+    abort_reason = ""
     if decision.action == ACTION_APPLY:
-        # Race guard: the job could have started between probe and apply.
-        recheck = probe_dq05(args.ssh_target)
-        if not recheck.reachable:
-            apply_detail = f"re-check failed ({recheck.error}); not applied"
-            record.action = ACTION_DEFER
-            record.reason = f"{record.reason}; re-check before apply failed: {recheck.error}"
-        else:
-            idle2, idle2_detail, _ = classify_idle(
-                recheck.log_text,
-                recheck.act_containers,
-                now=time.time(),
-                max_job_age_s=args.max_job_age_s,
+        if act1 is None:
+            # No usable sample (DQ05 was unreachable): cannot fence, must not act.
+            abort_reason = "no fence sample available for this tick"
+        elif args.force_recreate:
+            fence["bypassed"] = (
+                "--force-recreate: the idle check and the quiet-window fence were "
+                "skipped (the apply still drains on SIGTERM instead of killing)"
             )
-            if not idle2 and not args.force_recreate:
-                apply_detail = f"aborted at re-check: {idle2_detail}"
-                record.action = ACTION_DEFER
-                record.reason = f"job appeared between probe and apply ({idle2_detail})"
+        else:
+            # (b) A single idle sample is not a fence. Require the coordinator to
+            # be observably idle at BOTH ends of a settle window, with no new
+            # trigger/repo-event/queue log line, no change in the live act
+            # container set and no queued job in between. Any change aborts this
+            # tick: the only thing we lose is five minutes.
+            settle_s = max(0.0, float(args.settle_s))
+            settle_started = time.time()
+            if settle_s > 0:
+                SETTLE_SLEEP(settle_s)
+            fence["settle_elapsed_s"] = round(time.time() - settle_started, 1)
+            dq2 = probe_dq05(args.ssh_target)
+            if not dq2.reachable:
+                abort_reason = f"re-probe after the settle window failed ({dq2.error})"
             else:
-                ok, out = apply_limit(args.ssh_target, decision.limit)
-                apply_detail = out
-                ps_after = {}
-                for line in out.splitlines():
-                    if "|" in line:
-                        parts = line.split("|")
-                        if len(parts) >= 2:
-                            ps_after[parts[0].strip()] = parts[1].strip()
-                record.extra["apply"] = {
-                    "ssh_ok": ok,
-                    "env_now": next(
-                        (l for l in out.splitlines() if l.startswith("ENV_NOW=")), ""
-                    ),
-                    "backup": next((l for l in out.splitlines() if l.startswith("BACKUP=")), ""),
-                    "ps_after": ps_after,
-                }
-                if not ok or ps_after.get("ngit-ci-deploy-coordinator-1") != "running":
-                    record.action = ACTION_DEFER
-                    record.reason = f"{record.reason}; apply verification FAILED"
+                act2, (idle2, idle2_detail, _) = sample(dq2)
+                changed2, why2 = new_activity(act1, act2)
+                fence["samples"] = 2
+                fence["sample_2"] = act2.as_dict()
+                fence["changed"] = changed2
+                fence["change_reason"] = why2
+                fence["orphans"] = act2.as_dict()["orphans"]
+                if changed2:
+                    abort_reason = (
+                        f"job activity during the {settle_s:.0f}s settle window: {why2}"
+                    )
+                elif not idle2:
+                    abort_reason = (
+                        f"coordinator not idle at the end of the settle window ({idle2_detail})"
+                    )
+                else:
+                    # (c) The window proved it *was* quiet, but the coordinator
+                    # starts jobs autonomously; sample once more immediately
+                    # before the recreate and abort on any change since.
+                    dq3 = probe_dq05(args.ssh_target)
+                    if not dq3.reachable:
+                        abort_reason = f"pre-apply re-check failed ({dq3.error})"
+                    else:
+                        act3, (idle3, idle3_detail, _) = sample(dq3)
+                        changed3, why3 = new_activity(act2, act3)
+                        fence["samples"] = 3
+                        fence["sample_3"] = act3.as_dict()
+                        fence["pre_apply_recheck"] = {"changed": changed3, "reason": why3}
+                        fence["orphans"] = act3.as_dict()["orphans"]
+                        if changed3:
+                            abort_reason = (
+                                "job activity appeared between the settle sample and the "
+                                f"recreate: {why3}"
+                            )
+                        elif not idle3:
+                            abort_reason = (
+                                f"coordinator not idle immediately before the recreate "
+                                f"({idle3_detail})"
+                            )
+
+        if abort_reason:
+            # (f) Fail closed: nothing is applied, the next tick tries again, and
+            # the reason is in the decision log.
+            fence["defer_reason"] = abort_reason
+            record.action = ACTION_DEFER
+            record.reason = f"{record.reason}; FENCE HELD: {abort_reason}"
+            apply_detail = f"fence held: {abort_reason}"
+        else:
+            ok, out = apply_limit(
+                args.ssh_target, decision.limit, stop_grace_s=args.stop_grace_s
+            )
+            apply_detail = out
+            ps_after = {}
+            for line in out.splitlines():
+                if "|" in line:
+                    parts = line.split("|")
+                    if len(parts) >= 2:
+                        ps_after[parts[0].strip()] = parts[1].strip()
+
+            def _field(name: str) -> str:
+                return next(
+                    (l.split("=", 1)[1] for l in out.splitlines() if l.startswith(f"{name}=")),
+                    "",
+                )
+
+            record.extra["apply"] = {
+                "ssh_ok": ok,
+                "env_now": next(
+                    (l for l in out.splitlines() if l.startswith("ENV_NOW=")), ""
+                ),
+                "backup": next((l for l in out.splitlines() if l.startswith("BACKUP=")), ""),
+                # Verification of the value the *process* sees, not just the file.
+                "runtime_value": _field("RUNTIME_VALUE"),
+                # How long the drain-safe stop waited: >0s means a real drain.
+                "stop_took_s": _field("STOP_TOOK_S"),
+                "graceful_drain_observed": "graceful drain" in out.lower(),
+                "ps_after": ps_after,
+            }
+            if not ok:
+                record.action = ACTION_DEFER
+                record.reason = f"{record.reason}; apply verification FAILED (non-zero exit)"
+            elif _field("RUNTIME_VALUE") != str(int(decision.limit)):
+                record.action = ACTION_DEFER
+                record.reason = (
+                    f"{record.reason}; apply verification FAILED: the running coordinator "
+                    f"reports {ENV_KEY}={_field('RUNTIME_VALUE') or 'UNKNOWN'}, "
+                    f"expected {decision.limit}"
+                )
+            elif ps_after.get("ngit-ci-deploy-coordinator-1") != "running":
+                record.action = ACTION_DEFER
+                record.reason = f"{record.reason}; apply verification FAILED"
+    elif decision.action == ACTION_NOOP:
+        fence["note"] = "no change needed; the quiet-window fence was not run"
+
+    if record.action == ACTION_DEFER and not fence["defer_reason"]:
+        fence["defer_reason"] = record.reason
 
     write_log(log_file, record.as_dict())
 
@@ -807,6 +1091,21 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  signal: {note}")
         if record.idle is not None:
             print(f"  idle: {record.idle} ({record.idle_detail})")
+        changed_note = f" ({fence['change_reason']})" if fence["change_reason"] else ""
+        print(
+            f"  fence: samples={fence['samples']} settle={fence['settle_s']:.0f}s"
+            f" elapsed={fence.get('settle_elapsed_s', 0)}s"
+            f" changed={fence['changed']}{changed_note}"
+        )
+        for orphan in fence["orphans"]:
+            print(
+                f"  fence orphan (reported, not blocking): {orphan['name']} "
+                f"age={orphan['age_s']}s"
+            )
+        if fence["bypassed"]:
+            print(f"  fence bypassed: {fence['bypassed']}")
+        if fence["defer_reason"]:
+            print(f"  fence defer reason: {fence['defer_reason']}")
         if apply_detail:
             print("  apply output:")
             for line in apply_detail.splitlines():

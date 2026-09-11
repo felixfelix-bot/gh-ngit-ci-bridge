@@ -13,10 +13,17 @@ Environment=HOME=/home/c03rad0r
 Environment=PATH=/home/c03rad0r/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 Environment=PYTHONUNBUFFERED=1
 ExecStart=/usr/bin/python3 /home/c03rad0r/repos/gh-ngit-ci-bridge/ci_concurrency_controller.py --quiet
-# 0 = tick completed (apply | noop | defer | dry-run). A non-zero exit means we
-# could not even decide (no fresh signal / unreadable state) - that is a real
-# failure and must be visible.
-SuccessExitStatus=0
+# 0 = tick completed (apply | noop | defer | dry-run) | 3 = another tick holds
+# the single-flight flock (not an error: it means the guard is working). A
+# non-zero exit other than 3 means we could not even decide (no fresh signal /
+# unreadable state) - that is a real failure and must be visible.
+#
+# Note: a drain-safe tick can legitimately run for up to the apply's stop-grace
+# period (default 33 min) when the coordinator has to finish an in-flight job
+# before it exits. Type=oneshot disables TimeoutStartSec by default, so systemd
+# will not kill such a tick - do not add a TimeoutStartSec= shorter than that
+# stop grace. The timer simply skips its activations while the unit is active.
+SuccessExitStatus=0 3
 StandardOutput=journal
 StandardError=journal
 Nice=10
