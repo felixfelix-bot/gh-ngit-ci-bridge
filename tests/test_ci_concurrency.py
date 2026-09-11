@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -22,6 +23,24 @@ import ci_concurrency as cc  # noqa: E402
 import ci_concurrency_controller as ccm  # noqa: E402
 
 CEIL = 2.0
+
+
+@pytest.fixture(autouse=True)
+def _fast_isolated_tick(tmp_path_factory, monkeypatch):
+    """Never sleep through the settle window, never touch the real lock file.
+
+    The controller's production settle window is 90s; a test that exercises the
+    apply path must still drive the *comparison* between samples (that is the
+    fence), so only the waiting is stubbed. The single-flight lock is redirected
+    into a temp dir so a test can never collide with the installed timer's lock
+    (or leave one behind for it).
+    """
+    monkeypatch.setattr(ccm, "SETTLE_SLEEP", lambda seconds: None)
+    monkeypatch.setattr(
+        ccm,
+        "DEFAULT_LOCK_FILE",
+        str(tmp_path_factory.mktemp("ticklock") / "ci-concurrency.lock"),
+    )
 
 
 def sig(pool=2.0, raw=2.0, ceiling=CEIL, velocity=0.0, **kw) -> cc.Signal:
@@ -343,11 +362,14 @@ def _state_file(tmp_path, now, pool=2.0, raw=2.0):
 def test_main_applies_only_when_idle_and_changed(tmp_path, monkeypatch, capsys):
     calls = []
 
-    def fake_apply(target, limit, timeout=240):
+    def fake_apply(target, limit, timeout=None, *, stop_grace_s=None):
         calls.append((target, limit))
         return True, (
             "ENV_NOW=NGIT_CI_MAX_CONCURRENT_JOBS=3\n"
             "BACKUP=.env.bak.20260911-140000\n"
+            "STOP_TOOK_S=0\n"
+            "RUNTIME_VALUE=3\n"
+            "Entry: Entering graceful drain: freezing intake and queued-job starts\n"
             "ngit-ci-deploy-coordinator-1|running|Up 1 second\n"
             "ngit-ci-deploy-dind-1|running|Up 2 days\n"
         )
@@ -441,7 +463,7 @@ def test_main_respects_the_override_file(tmp_path, monkeypatch):
     seen = {}
     monkeypatch.setattr(ccm, "probe_dq05", lambda target, timeout=90: _fake_probe(1, LOG_IDLE))
 
-    def fake_apply(target, limit, timeout=240):
+    def fake_apply(target, limit, timeout=None, *, stop_grace_s=None):
         seen["limit"] = limit
         return True, "ngit-ci-deploy-coordinator-1|running|Up 1 second\n"
 
@@ -514,6 +536,7 @@ def test_log_record_carries_exactly_the_expected_fields(tmp_path, monkeypatch):
     expected = {
         "ts", "signal", "computed_limit", "previous_limit", "action", "reason",
         "idle", "idle_detail", "override", "dry_run", "dq05", "signal_notes",
+        "fence",
     }
     assert set(record) == expected
     blob = json.dumps(record).lower()
@@ -572,7 +595,12 @@ def test_main_uses_the_freshest_signal_source_when_none_is_pinned(tmp_path, monk
     live.write_text(json.dumps({"x": [2.0, 0.0], "ts": now}))
     monkeypatch.setattr(ccm, "probe_dq05", lambda target, timeout=90: _fake_probe(1, LOG_IDLE))
     monkeypatch.setattr(
-        ccm, "apply_limit", lambda target, limit, timeout=240: (True, "ngit-ci-deploy-coordinator-1|running|Up 1s\n")
+        ccm,
+        "apply_limit",
+        lambda target, limit, timeout=None, *, stop_grace_s=None: (
+            True,
+            "RUNTIME_VALUE=3\nngit-ci-deploy-coordinator-1|running|Up 1s\n",
+        ),
     )
     log = tmp_path / "ci.log"
     rc = ccm.main(
@@ -629,7 +657,14 @@ def test_main_falls_back_to_the_probe_when_no_state_is_fresh(tmp_path, monkeypat
     probe = tmp_path / "compute_max_workers.py"
     probe.write_text("")
     monkeypatch.setattr(ccm, "probe_dq05", lambda target, timeout=90: _fake_probe(1, LOG_IDLE))
-    monkeypatch.setattr(ccm, "apply_limit", lambda target, limit, timeout=240: (True, ""))
+    monkeypatch.setattr(
+        ccm,
+        "apply_limit",
+        lambda target, limit, timeout=None, *, stop_grace_s=None: (
+            True,
+            "RUNTIME_VALUE=3\nngit-ci-deploy-coordinator-1|running|Up 1s\n",
+        ),
+    )
     monkeypatch.setattr(
         ccm,
         "probe_capacity_readonly",
@@ -796,3 +831,487 @@ def test_no_key_material_is_read_by_the_module():
     src = Path(ccm.__file__).read_text()
     for banned in ("nsec", "private key", "bunker://"):
         assert banned not in src.lower().replace("never logs key material", "")
+
+
+# =========================================================== the recreate fence
+#
+# The race being closed: the controller decides to change NGIT_CI_MAX_CONCURRENT_JOBS,
+# observes the coordinator is idle ONCE, and then recreates the container. The
+# coordinator starts jobs by itself whenever it sees a repo event on the relays,
+# so a job can begin between that single sample and the recreate.
+#
+# Every test below drives the real decision path (ccm.main) with a scripted
+# probe; only the settle *wait* and the ssh transport are stubbed — never the
+# comparison logic that constitutes the fence.
+
+REPO_DIR = Path(ccm.__file__).resolve().parent
+
+
+def _idle_probe(limit=1, *, containers=None, log=LOG_IDLE, queue_text=""):
+    st = _fake_probe(limit, log, containers=containers)
+    st.queue_text = queue_text
+    return st
+
+
+def _busy_probe(limit=1):
+    st = _fake_probe(limit, LOG_BUSY)
+    st.queue_text = ""
+    return st
+
+
+def _scripted(*states):
+    """A probe_dq05 replacement returning one scripted state per call."""
+    calls = {"n": 0}
+
+    def probe(target, timeout=90):
+        state = states[min(calls["n"], len(states) - 1)]
+        calls["n"] += 1
+        return state
+
+    return probe, calls
+
+
+def _applied_ok(target, limit, timeout=None, *, stop_grace_s=None):
+    """A faithful stand-in for the drain-safe apply's output."""
+    return True, (
+        f"ENV_NOW=NGIT_CI_MAX_CONCURRENT_JOBS={limit}\n"
+        "BACKUP=.env.bak.20260911-140000\n"
+        "STOP_TOOK_S=0\n"
+        "DRAIN_TAIL:\n"
+        "  coordinator-1  | Entering graceful drain: freezing intake and queued-job starts\n"
+        "  coordinator-1  | ngit-ci coordinator stopped\n"
+        f"RUNTIME_VALUE={limit}\n"
+        "PS_AFTER:\n"
+        "ngit-ci-deploy-coordinator-1|running|Up 1 second\n"
+        "ngit-ci-deploy-dind-1|running|Up 2 days\n"
+    )
+
+
+def _tick_args(tmp_path, *, settle=0, log="ci.log"):
+    return [
+        "--state-file", str(_state_file(tmp_path, time.time())),
+        "--fallback-state-file", str(tmp_path / "none.json"),
+        "--override-file", str(tmp_path / "none.override"),
+        "--lock-file", str(tmp_path / "ci-concurrency.lock"),
+        "--log-file", str(tmp_path / log),
+        "--settle-s", str(settle),
+        "--quiet",
+    ]
+
+
+def _records(tmp_path, log="ci.log"):
+    text = (tmp_path / log).read_text().strip()
+    return [json.loads(line) for line in text.splitlines() if line.strip()]
+
+
+def test_fence_aborts_when_a_job_starts_during_the_settle_window(tmp_path, monkeypatch):
+    """THE race: idle at sample 1, a job starts, busy at sample 2 -> abort."""
+    applied = []
+    monkeypatch.setattr(
+        ccm, "apply_limit", lambda *a, **kw: applied.append(a) or (True, "")
+    )
+    probe, calls = _scripted(_idle_probe(1), _busy_probe(1))
+    monkeypatch.setattr(ccm, "probe_dq05", probe)
+
+    rc = ccm.main(_tick_args(tmp_path, settle=1))
+
+    assert rc == 0
+    record = _records(tmp_path)[-1]
+    assert record["action"] == "defer", record["reason"]
+    assert "FENCE HELD" in record["reason"]
+    assert record["fence"]["samples"] == 2
+    assert record["fence"]["changed"] is True
+    assert "new trigger/repo-event/queue log line" in record["fence"]["change_reason"]
+    assert calls["n"] == 2, "the fence must stop sampling once it has aborted"
+    assert applied == [], "the coordinator must NOT be recreated"
+
+
+def test_fence_aborts_when_a_job_starts_after_the_settle_sample(tmp_path, monkeypatch):
+    """Clause (c): the job appears between the second sample and the recreate."""
+    applied = []
+    monkeypatch.setattr(
+        ccm, "apply_limit", lambda *a, **kw: applied.append(a) or (True, "")
+    )
+    probe, calls = _scripted(_idle_probe(1), _idle_probe(1), _busy_probe(1))
+    monkeypatch.setattr(ccm, "probe_dq05", probe)
+
+    rc = ccm.main(_tick_args(tmp_path, settle=1))
+
+    assert rc == 0
+    record = _records(tmp_path)[-1]
+    assert record["action"] == "defer", record["reason"]
+    assert record["fence"]["samples"] == 3
+    assert record["fence"]["pre_apply_recheck"]["changed"] is True
+    assert "between the settle sample and the recreate" in record["reason"]
+    assert calls["n"] == 3
+    assert applied == []
+
+
+def test_fence_aborts_when_a_queued_job_appears_between_the_samples(tmp_path, monkeypatch):
+    """No queued job at sample 1, two queued at sample 2 -> abort."""
+    applied = []
+    monkeypatch.setattr(
+        ccm, "apply_limit", lambda *a, **kw: applied.append(a) or (True, "")
+    )
+    queued = json.dumps({"jobs": [{"run": "a"}, {"run": "b"}], "suspended_at": time.time()})
+    probe, _ = _scripted(_idle_probe(1), _idle_probe(1, queue_text=queued))
+    monkeypatch.setattr(ccm, "probe_dq05", probe)
+
+    rc = ccm.main(_tick_args(tmp_path, settle=1))
+
+    assert rc == 0
+    record = _records(tmp_path)[-1]
+    assert record["action"] == "defer", record["reason"]
+    assert "queued jobs changed 0 -> 2" in record["fence"]["change_reason"]
+    assert applied == []
+
+
+def test_orphan_act_container_is_reported_and_does_not_block(tmp_path, monkeypatch):
+    """Production case: act left `act-Test-and-Build-...` running for 2 hours.
+
+    It is provably not a live job (older than the coordinator's own 30-minute
+    job timeout), so it must be reported and ignored — never mistaken for an
+    active job (which would deadlock the controller forever).
+    """
+    now = time.time()
+    orphan = [
+        {
+            "name": "act-Test-and-Build-Test-x86-64-497b79c0",
+            "running": True,
+            "started": now - 7200,  # "Up 2 hours"
+        }
+    ]
+    probe, _ = _scripted(_idle_probe(1, containers=orphan))
+    monkeypatch.setattr(ccm, "probe_dq05", probe)
+    monkeypatch.setattr(ccm, "apply_limit", _applied_ok)
+
+    rc = ccm.main(_tick_args(tmp_path, settle=0))
+
+    assert rc == 0
+    record = _records(tmp_path)[-1]
+    assert record["action"] == "apply", record["reason"]
+    reported = record["fence"]["orphans"]
+    assert len(reported) == 1 and reported[0]["name"].startswith("act-")
+    assert reported[0]["age_s"] > cc.MAX_JOB_AGE_S
+    assert "orphan" in record["fence"]["orphan_policy"]
+    assert record["idle"] is True
+
+
+def test_a_young_act_container_still_defers_the_change(tmp_path, monkeypatch):
+    """The flip side of the orphan policy: fail closed on anything that might be live."""
+    applied = []
+    monkeypatch.setattr(
+        ccm, "apply_limit", lambda *a, **kw: applied.append(a) or (True, "")
+    )
+    now = time.time()
+    live = [{"name": "act-Build-Test-1", "running": True, "started": now - 300}]
+    probe, _ = _scripted(_idle_probe(1, containers=live))
+    monkeypatch.setattr(ccm, "probe_dq05", probe)
+
+    rc = ccm.main(_tick_args(tmp_path, settle=0))
+
+    assert rc == 0
+    record = _records(tmp_path)[-1]
+    assert record["action"] == "defer"
+    assert record["fence"]["samples"] == 1, "the fence is not even started when busy"
+    assert applied == []
+
+
+def test_genuinely_idle_applies_exactly_once_and_is_idempotent(tmp_path, monkeypatch):
+    limits = []
+
+    def apply(target, limit, timeout=None, *, stop_grace_s=None):
+        limits.append(limit)
+        return _applied_ok(target, limit)
+
+    probe, _ = _scripted(_idle_probe(1))
+    monkeypatch.setattr(ccm, "probe_dq05", probe)
+    monkeypatch.setattr(ccm, "apply_limit", apply)
+
+    rc = ccm.main(_tick_args(tmp_path, settle=0))
+    assert rc == 0
+    first = _records(tmp_path)[-1]
+    assert first["action"] == "apply"
+    assert first["fence"]["samples"] == 3
+    assert first["fence"]["changed"] is False
+    assert first["apply"]["runtime_value"] == "3"
+    assert first["apply"]["graceful_drain_observed"] is True
+    assert limits == [3]
+
+    # Second tick: the coordinator now reports the new value, so nothing to do.
+    probe2, _ = _scripted(_idle_probe(3))
+    monkeypatch.setattr(ccm, "probe_dq05", probe2)
+    rc2 = ccm.main(_tick_args(tmp_path, settle=0))
+    assert rc2 == 0
+    second = _records(tmp_path)[-1]
+    assert second["action"] == "noop"
+    assert second["fence"]["note"].startswith("no change needed")
+    assert limits == [3], "the recreate must happen exactly once"
+
+
+def test_the_settle_window_is_actually_waited_for(tmp_path, monkeypatch):
+    waits = []
+    monkeypatch.setattr(ccm, "SETTLE_SLEEP", lambda seconds: waits.append(seconds))
+    probe, _ = _scripted(_idle_probe(1))
+    monkeypatch.setattr(ccm, "probe_dq05", probe)
+    monkeypatch.setattr(ccm, "apply_limit", _applied_ok)
+
+    ccm.main(_tick_args(tmp_path, settle=90))
+
+    assert waits == [90], "the quiet window must be waited out in production"
+
+
+def test_apply_verification_failure_is_not_reported_as_applied(tmp_path, monkeypatch):
+    """The running process must report the new value, not just the .env file."""
+    monkeypatch.setattr(ccm, "probe_dq05", _scripted(_idle_probe(1))[0])
+    monkeypatch.setattr(
+        ccm,
+        "apply_limit",
+        lambda *a, **kw: (
+            True,
+            "ENV_NOW=NGIT_CI_MAX_CONCURRENT_JOBS=3\nRUNTIME_VALUE=1\n"
+            "ngit-ci-deploy-coordinator-1|running|Up 1 second\n",
+        ),
+    )
+
+    rc = ccm.main(_tick_args(tmp_path, settle=0))
+
+    assert rc == 0
+    record = _records(tmp_path)[-1]
+    assert record["action"] == "defer"
+    assert "apply verification FAILED" in record["reason"]
+    assert "NGIT_CI_MAX_CONCURRENT_JOBS=1" in record["reason"]
+
+
+def test_fence_defers_when_the_settle_re_probe_fails(tmp_path, monkeypatch):
+    """Fail closed: unprovable idle is not idle."""
+    applied = []
+    monkeypatch.setattr(
+        ccm, "apply_limit", lambda *a, **kw: applied.append(a) or (True, "")
+    )
+    unreachable = ccm.Dq05State(reachable=False, error="ssh probe exit 255")
+    probe, _ = _scripted(_idle_probe(1), unreachable)
+    monkeypatch.setattr(ccm, "probe_dq05", probe)
+
+    rc = ccm.main(_tick_args(tmp_path, settle=1))
+
+    assert rc == 0
+    record = _records(tmp_path)[-1]
+    assert record["action"] == "defer"
+    assert "re-probe after the settle window failed" in record["reason"]
+    assert record["fence"]["samples"] == 1
+    assert applied == []
+
+
+def test_a_queued_job_defers_before_the_fence_even_starts(tmp_path, monkeypatch):
+    applied = []
+    monkeypatch.setattr(
+        ccm, "apply_limit", lambda *a, **kw: applied.append(a) or (True, "")
+    )
+    queued = json.dumps({"jobs": [{"run": "a"}], "suspended_at": time.time() - 30})
+    probe, _ = _scripted(_idle_probe(1, queue_text=queued))
+    monkeypatch.setattr(ccm, "probe_dq05", probe)
+
+    rc = ccm.main(_tick_args(tmp_path, settle=0))
+
+    assert rc == 0
+    record = _records(tmp_path)[-1]
+    assert record["action"] == "defer"
+    assert "queued job(s) not started yet" in record["reason"]
+    assert applied == []
+
+
+# ----------------------------------------------------------- mutual exclusion
+
+
+def test_the_lock_prevents_a_second_tick(tmp_path, monkeypatch):
+    def explode(*a, **kw):
+        raise AssertionError("a locked-out tick must not probe DQ05 at all")
+
+    monkeypatch.setattr(ccm, "probe_dq05", explode)
+    holder = ccm.TickLock(tmp_path / "ci-concurrency.lock")
+    holder.__enter__()
+    try:
+        rc = ccm.main(_tick_args(tmp_path, settle=0))
+        assert rc == ccm.EXIT_LOCKED
+    finally:
+        holder.__exit__()
+
+    record = _records(tmp_path)[-1]
+    assert record["action"] == "lock_held"
+    assert "another tick holds the lock" in record["reason"]
+
+    # ...and the lock is released with the process, so the next tick runs.
+    probe, _ = _scripted(_idle_probe(1))
+    monkeypatch.setattr(ccm, "probe_dq05", probe)
+    monkeypatch.setattr(ccm, "apply_limit", _applied_ok)
+    assert ccm.main(_tick_args(tmp_path, settle=0)) == 0
+    assert _records(tmp_path)[-1]["action"] == "apply"
+
+
+def test_two_real_concurrent_ticks_cannot_overlap(tmp_path):
+    """Two genuine controller processes, racing over the same flock.
+
+    ssh is faked so the test is offline; everything else is the real program.
+    The first tick holds the lock while it sits in its settle window, so the
+    second must refuse to run rather than start a second recreate.
+    """
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    payload = "\n".join(
+        [
+            "===ENV===",
+            "NGIT_CI_REPOS=npub1x677",
+            "NGIT_CI_MAX_CONCURRENT_JOBS=1",
+            "===MEM===",
+            "5536000",
+            "===PS===",
+            "ngit-ci-deploy-coordinator-1|running|Up 2 hours",
+            "ngit-ci-deploy-dind-1|running|Up 2 days",
+            "===LOGS===",
+            LOG_IDLE,
+            "===ACT===",
+            "===QUEUE===",
+            "RUNTIME_VALUE=3",
+            "===END===",
+        ]
+    )
+    (bindir / "payload.txt").write_text(payload)
+    fake_ssh = bindir / "ssh"
+    fake_ssh.write_text(
+        '#!/usr/bin/env bash\ncat >/dev/null 2>&1\ncat "$(dirname "$0")/payload.txt"\n'
+    )
+    fake_ssh.chmod(0o755)
+    env = dict(os.environ, PATH=f"{bindir}{os.pathsep}{os.environ.get('PATH', '')}")
+
+    common = [
+        sys.executable,
+        str(REPO_DIR / "ci_concurrency_controller.py"),
+        "--state-file", str(_state_file(tmp_path, time.time())),
+        "--fallback-state-file", str(tmp_path / "none.json"),
+        "--override-file", str(tmp_path / "none.override"),
+        "--lock-file", str(tmp_path / "ci-concurrency.lock"),
+        "--settle-s", "5",
+        "--quiet",
+    ]
+    first = subprocess.Popen(
+        common + ["--log-file", str(tmp_path / "first.log")],
+        env=env,
+        cwd=str(REPO_DIR),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        time.sleep(1.5)  # the first tick is now inside its settle window
+        second = subprocess.run(
+            common + ["--log-file", str(tmp_path / "second.log")],
+            env=env,
+            cwd=str(REPO_DIR),
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        assert second.returncode == ccm.EXIT_LOCKED, second.stderr
+        assert _records(tmp_path, "second.log")[-1]["action"] == "lock_held"
+    finally:
+        _out, err = first.communicate(timeout=120)
+    assert first.returncode == 0, err.decode()
+    winner = _records(tmp_path, "first.log")[-1]
+    assert winner["action"] == "apply"
+    assert winner["fence"]["samples"] == 3
+    assert winner["apply"]["runtime_value"] == "3"
+
+
+# ------------------------------------------------------- fence unit behaviour
+
+
+def test_new_activity_flags_a_new_lifecycle_line():
+    now = LAST_DONE_TS + 3600
+    changed, why = cc.new_activity(
+        cc.fingerprint_jobs(LOG_IDLE, [], now=now),
+        cc.fingerprint_jobs(LOG_BUSY, [], now=now),
+    )
+    assert changed is True
+    assert "new trigger/repo-event/queue log line" in why
+
+
+def test_new_activity_is_quiet_for_an_unchanged_coordinator():
+    changed, why = cc.new_activity(
+        cc.fingerprint_jobs(LOG_IDLE, [], now=LAST_DONE_TS + 3600),
+        cc.fingerprint_jobs(LOG_IDLE, [], now=LAST_DONE_TS + 3690),
+    )
+    assert changed is False, why
+
+
+def test_new_activity_flags_a_live_act_container_appearing():
+    now = time.time()
+    changed, why = cc.new_activity(
+        cc.fingerprint_jobs(LOG_IDLE, [], now=now),
+        cc.fingerprint_jobs(
+            LOG_IDLE, [{"name": "act-Build-1", "running": True, "started": now - 5}], now=now
+        ),
+    )
+    assert changed is True and "live act containers changed" in why
+
+
+def test_new_activity_does_not_mistake_a_log_rollover_for_work():
+    """The window shrinking is not activity: no *new* line identity appeared."""
+    rolled = "\n".join(LOG_IDLE.splitlines()[2:])
+    changed, why = cc.new_activity(
+        cc.fingerprint_jobs(LOG_IDLE, [], now=LAST_DONE_TS + 3600),
+        cc.fingerprint_jobs(rolled, [], now=LAST_DONE_TS + 3690),
+    )
+    assert changed is False, why
+
+
+def test_queued_job_policy_ignores_a_checkpoint_ngit_ci_would_discard():
+    now = time.time()
+    fresh = json.dumps({"jobs": [{"a": 1}], "suspended_at": now - 10})
+    expired = json.dumps({"jobs": [{"a": 1}], "suspended_at": now - 7200})
+    assert cc.parse_queued_jobs(fresh, now=now)[0] == 1
+    assert cc.parse_queued_jobs(expired, now=now)[0] == 0, (
+        "an expired checkpoint is dropped by ngit-ci, so it cannot block forever"
+    )
+    assert cc.parse_queued_jobs("", now=now)[0] == 0
+    assert cc.parse_queued_jobs("not json", now=now)[0] == 0
+    assert cc.parse_queued_jobs('{"jobs": []}', now=now)[0] == 0
+
+
+def test_classify_idle_defers_on_a_queued_job():
+    idle, reason, facts = cc.classify_idle(
+        LOG_IDLE,
+        [],
+        now=LAST_DONE_TS + 3600,
+        queued_jobs=2,
+        queued_detail="2 job(s) frozen 10s ago",
+    )
+    assert idle is False
+    assert "queued job(s) not started yet" in reason
+    assert facts["queued_jobs"] == 2
+
+
+def test_the_apply_drains_before_recreating_and_verifies_the_runtime_value():
+    script = ccm.APPLY_SCRIPT
+    drain = script.index("docker compose stop -t __GRACE__ coordinator")
+    recreate = script.index("docker compose up -d coordinator")
+    assert drain < recreate, "the stop (drain) must precede the recreate"
+    assert "RUNTIME_VALUE=" in script
+    assert "DRAIN_TAIL:" in script
+
+    seen = {}
+
+    def runner(cmd, input=None, capture_output=None, text=None, timeout=None):
+        seen.update(cmd=cmd, script=input, timeout=timeout)
+        return _Proc(stdout="RUNTIME_VALUE=2\n", stderr="", returncode=0)
+
+    monkeypatch = pytest.MonkeyPatch()
+    try:
+        monkeypatch.setattr(ccm.subprocess, "run", runner)
+        ok, _ = ccm.apply_limit("dq05", 2, stop_grace_s=1980)
+    finally:
+        monkeypatch.undo()
+
+    assert ok is True
+    assert seen["script"].count("docker compose stop -t 1980 coordinator") == 1
+    assert "__GRACE__" not in seen["script"] and "__LIMIT__" not in seen["script"]
+    assert seen["timeout"] > 1980, "a full 30-minute drain is a success, not a timeout"
