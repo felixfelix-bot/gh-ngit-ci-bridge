@@ -6,6 +6,12 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 WorkingDirectory=/home/c03rad0r/repos/gh-ngit-ci-bridge
+# git-remote-nostr, nak and gh live in ~/.local/bin and /usr/bin; systemd user
+# units start with a minimal PATH, and without this the mirror push fails with
+# "git: 'remote-nostr' is not a git command".
+Environment=HOME=/home/c03rad0r
+Environment=PATH=/home/c03rad0r/.local/bin:/home/c03rad0r/.hermes/hermes-agent/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=PYTHONUNBUFFERED=1
 ExecStart=/usr/bin/python3 /home/c03rad0r/repos/gh-ngit-ci-bridge/bridge.py --config /home/c03rad0r/repos/gh-ngit-ci-bridge/config.json
 # 0 ok | 3 another tick holds the lock (not an error) | 2 runtime error | 4 config error
 SuccessExitStatus=0 3
