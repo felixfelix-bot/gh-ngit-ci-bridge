@@ -33,10 +33,25 @@ the 30618 the coordinator already listens for.
 | `decision.py` | pure decision logic (unit-tested, no I/O) |
 | `nostr_event.py` | signs an event with the key in `key_file` — key never enters argv |
 | `config.json` | committed config: identities, orgs/repos, relays, intervals. No secrets |
+| `audit.py` | reports, per watched repo, whether a CI run is even possible (mirror? workflows?) |
 | `tests/test_decision.py` | unit tests for the decision matrix |
 | `systemd/*` | user timer + service (every 5 minutes) |
 | `install.sh` | installs and enables the timer |
 | `.ngit/act/workflows/bridge-smoke.yml` | the repo's own ngit-CI workflow |
+
+## Hard-won lessons about git-remote-nostr (read before touching the push path)
+
+1. **It reads `nostr.nsec`/`nostr.npub` from the repository's own `.git/config`** and ignores
+   `GIT_CONFIG_*` environment injection. Injecting via the environment makes it sign as the
+   machine-global ngit account, which is rejected as a non-maintainer.
+2. **It exits 0 when it rejects the push** (`your nostr account … isn't listed as a
+   maintainer`) and prints `Error: could not update remote_ref locally` on pushes that
+   succeeded. Never trust its exit status — verify with
+   `git ls-remote https://relay.ngit.dev/<npub>/<repo>.git refs/heads/<branch>`.
+3. The source side of a push refspec must be a **ref name**; pushing a bare SHA fails with
+   `cannot find ref <sha>`. The bridge stages `refs/bridge-publish/<branch>` first.
+4. `ngit init` **replaces `origin` with a `nostr://` remote**. Keep a separate `origin` for
+   GitHub and a `ngit` remote for Nostr.
 
 ## Install
 
@@ -58,6 +73,7 @@ python3 bridge.py --dry-run --repo OpenTollGate/tollgate-module-basic-go \
                   --sha <sha>                    # classify one specific commit
 python3 bridge.py --refresh-mirrors              # re-read kind-30617 announcements now
 python3 bridge.py --repo owner/name              # real run, one repo only
+python3 audit.py                                 # what can trigger CI today, per repo
 ```
 
 Exit codes: `0` ok, `2` runtime error, `3` another tick holds the lock,
