@@ -87,7 +87,7 @@ def main(argv: list[str]) -> int:
     import argparse
 
     parser = argparse.ArgumentParser(description="sign a nostr event and print it")
-    parser.add_argument("-k", "--kind", type=int, required=True)
+    parser.add_argument("-k", "--kind", type=int, help="event kind (required unless --print-pubkey)")
     parser.add_argument("-c", "--content", default="")
     parser.add_argument("-t", "--tag", action="append", default=[], help="tag as name=value")
     parser.add_argument(
@@ -107,6 +107,8 @@ def main(argv: list[str]) -> int:
 
         print(coincurve.PrivateKey(secret).public_key.format(compressed=True)[1:].hex())
         return 0
+    if args.kind is None:
+        parser.error("-k/--kind is required unless --print-pubkey is given")
 
     tags: list[list[str]] = []
     for item in args.tag:

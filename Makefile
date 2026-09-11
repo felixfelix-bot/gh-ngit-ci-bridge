@@ -1,6 +1,9 @@
 # gh-ngit-ci-bridge
 PY ?= python3
 SIGNER ?= /opt/miniconda/bin/python3
+# the pytest entry point, not `python3 -m pytest`: on this host the pytest
+# module lives only in the miniconda interpreter
+PYTEST ?= pytest
 CONFIG ?= config.json
 
 .PHONY: help test dry once install logs lint
@@ -9,7 +12,7 @@ help:
 	@grep -E '^[a-z-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN{FS=":.*?## "}{printf "  \033[36m%-10s\033[0m %s\n", $$1, $$2}'
 
 test:  ## run the decision-logic unit tests
-	$(PY) -m pytest -q tests/test_decision.py
+	$(PYTEST) -q tests/test_decision.py
 
 lint:  ## byte-compile every module
 	$(PY) -m py_compile bridge.py decision.py nostr_event.py tests/test_decision.py
