@@ -50,6 +50,11 @@ from decision import (  # noqa: E402
     RepoSpec,
     decide,
 )
+from public_only import (  # noqa: E402
+    GateResult,
+    audit_table,
+    check,
+)
 
 EXIT_OK = 0
 EXIT_ERROR = 2
@@ -175,6 +180,54 @@ def save_state(path: Path, state: dict) -> None:
     with tmp.open("w") as handle:
         json.dump(state, handle, indent=2, sort_keys=True)
     tmp.replace(path)
+
+
+# --------------------------------------------------------- public-only gate
+
+
+def public_only_guard(slug: str, log: Log) -> bool:
+    """Fail-closed re-check immediately before a dangerous operation.
+
+    Returns True only when GitHub reports ``slug`` as exactly ``public``. A
+    denial is a PERMANENT skip for this tick: callers must ``continue`` without
+    calling record_failure(), so the repo never enters the failure/retry map and
+    cannot wedge the head marker. The check is live (never cached) and repeated
+    every tick, so a repo that flips from private to public is picked up later.
+    """
+    result = check(slug)
+    if result.allowed:
+        return True
+    log(
+        f"PUBLIC-ONLY gate: refusing {slug} (visibility={result.visibility}) - "
+        f"{result.reason}",
+        "WARN",
+    )
+    return False
+
+
+def select_public_repos(
+    repos: list[str],
+    log: Log | None = None,
+    query=None,
+) -> tuple[list[str], list[GateResult], list[GateResult]]:
+    """One tick's public-only gate over a repo list.
+
+    Returns ``(allowed_slugs, skipped_results, all_results)``. Skipped repos are
+    logged with their observed visibility and reported, but never removed from
+    config.json. ``query`` is injectable so this is unit-testable without a
+    network call.
+    """
+    results = [check(slug, query=query) for slug in repos]
+    allowed = [r.slug for r in results if r.allowed]
+    skipped = [r for r in results if not r.allowed]
+    if log is not None:
+        for result in skipped:
+            log(
+                f"PUBLIC-ONLY gate: skipping {result.slug} "
+                f"(visibility={result.visibility}) - {result.reason}",
+                "WARN",
+            )
+    return allowed, skipped, results
 
 
 # ------------------------------------------------------------------- gh helpers
@@ -542,11 +595,35 @@ def main(argv: list[str]) -> int:
             log(f"org {org}: {len(found)} repos")
         repos += state["org_repo_cache"][org]["repos"]
     repos = sorted(dict.fromkeys(repos))
+
+    # ---- PUBLIC-ONLY gate (fail-closed), applied at config load / tick start.
+    # GitHub repos that are not exactly `public` are never mirrored to nostr:
+    # nostr relays are public and permanent, so a private repo would leak
+    # irreversibly. Non-public entries are REPORTED and skipped for this tick;
+    # they are never silently removed from config.json, and because the gate is
+    # re-evaluated on every tick a repo that flips from private to public is
+    # picked up on a later tick.
+    allowed, gate_skipped, gate_results = select_public_repos(repos, log=log)
+    print("PUBLIC-ONLY gate (configured repo audit):", flush=True)
+    print(audit_table(gate_results), flush=True)
+    if gate_skipped:
+        log(
+            f"PUBLIC-ONLY gate: {len(gate_skipped)} of {len(gate_results)} repos refused "
+            "(kept in config.json, reported as skipped, not retried as failures): "
+            + ", ".join(f"{r.slug}={r.visibility}" for r in gate_skipped),
+            "WARN",
+        )
+    repos = allowed
+
     if args.repo:
         wanted = {r.lower() for r in args.repo}
         repos = [r for r in repos if r.lower() in wanted]
         if not repos:
-            repos = list(args.repo)
+            # explicitly requested repos that are outside the configured set are
+            # gated too, so --repo cannot smuggle in a private repository
+            repos, extra_skipped, extra_results = select_public_repos(list(args.repo), log=log)
+            if extra_skipped:
+                print(audit_table(extra_results), flush=True)
 
     log(f"tick start: {len(repos)} repos, dry_run={args.dry_run}, trigger_mode={trigger_mode}")
 
@@ -684,6 +761,13 @@ def main(argv: list[str]) -> int:
                     continue
 
                 # ---- real trigger
+                # Fail-closed re-check at the point of no return: never clone,
+                # push or publish for a repo GitHub does not report as `public`.
+                # A denial is a PERMANENT skip (no record_failure), so it is not
+                # retried and cannot wedge the head marker.
+                if not public_only_guard(slug, log):
+                    continue
+
                 ok, detail = mirror.prepare(slug, branch, sha)
                 if not ok:
                     log(f"{slug}@{branch} {sha[:12]} mirror prepare failed: {detail}", "ERROR")
@@ -691,6 +775,9 @@ def main(argv: list[str]) -> int:
                     continue
 
                 if decision.action == MIRROR_PUSH:
+                    # gate immediately before the ref is pushed to the ngit remote
+                    if not public_only_guard(slug, log):
+                        continue
                     pushed, push_detail = mirror.push_to_ngit(slug, repo_id, branch, sha)
                     if pushed:
                         # The relay can take a few seconds to index the freshly
@@ -722,6 +809,9 @@ def main(argv: list[str]) -> int:
                         # a state change for the coordinator to act on.
                         manual_targets = spec.workflows or tuple(mirror.workflows_at(slug, sha))
                         if cfg.get("also_manual_when_workflows", False) and manual_targets:
+                            # gate immediately before the 9840 publish call
+                            if not public_only_guard(slug, log):
+                                continue
                             for wf in manual_targets:
                                 sha256 = mirror.file_sha256(slug, sha, wf)
                                 if not sha256:
@@ -742,6 +832,9 @@ def main(argv: list[str]) -> int:
                         log(f"TRIGGER mirror_push FAILED {slug} sha={sha[:12]}: {push_detail}", "ERROR")
                         record_failure(state, sha, slug, branch, push_detail, cfg)
                 else:  # MANUAL_9840
+                    # gate immediately before the 9840 publish call
+                    if not public_only_guard(slug, log):
+                        continue
                     for wf in decision.workflows:
                         sha256 = mirror.file_sha256(slug, sha, wf)
                         if not sha256:

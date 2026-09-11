@@ -2,9 +2,14 @@
 """Audit which configured repos can actually trigger ngit-ci today.
 
 For every repo the bridge watches, report:
+  * its GitHub visibility (public/private/internal/...) — the public-only gate
   * whether an ngit mirror exists (kind-30617 announcement under the maintainer key)
   * whether the repo carries `.ngit/act/workflows/*.yml` at its default branch
   * therefore whether a GitHub commit there can produce a CI run
+
+A repo whose GitHub visibility is not exactly `public` is reported as
+`SKIP (not public)` and never considered mirrorable, no matter what mirrors
+exist: the public-only gate is fail-closed.
 
 Usage:
     python3 audit.py                    # table for every configured repo
@@ -16,18 +21,20 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import subprocess
 import sys
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 from bridge import Github, Log, Nostr, load_state  # noqa: E402
+from public_only import check  # noqa: E402
 
 RESET = "\033[0m"
 GREEN = "\033[32m"
 YELLOW = "\033[33m"
 RED = "\033[31m"
+
+SKIP_NOT_PUBLIC = "SKIP (not public)"
 
 
 def workflows_at_head(gh: Github, slug: str, branch: str) -> list[str] | None:
@@ -64,6 +71,9 @@ def main(argv: list[str]) -> int:
 
     rows = []
     for slug in repos:
+        # ---- PUBLIC-ONLY gate: fail-closed, evaluated live
+        gate = check(slug)
+
         override = cfg.get("repos", {}).get(slug, {}).get("ngit_repo_id")
         repo_id = override or slug.split("/")[-1]
         mirrored = repo_id in mirrors or (override is not None and override in mirrors)
@@ -71,20 +81,26 @@ def main(argv: list[str]) -> int:
             repo_id = repo_id.lower()
             mirrored = True
 
-        branch = gh.default_branch(slug) or "main"
-        wfs = workflows_at_head(gh, slug, branch) if mirrored else None
-
-        if not mirrored:
-            verdict, why = "CANNOT TRIGGER", "no ngit mirror (no kind-30617 announcement)"
-        elif not wfs:
-            verdict, why = "CANNOT RUN CI", "mirror exists but no .ngit/act/workflows/ at HEAD"
+        if not gate.allowed:
+            verdict = SKIP_NOT_PUBLIC
+            why = f"github visibility={gate.visibility}; public-only gate is fail-closed"
+            wfs: list[str] = []
         else:
-            verdict, why = "OK", f"{len(wfs)} workflow file(s)"
+            branch = gh.default_branch(slug) or "main"
+            wfs = (workflows_at_head(gh, slug, branch) or []) if mirrored else []
+            if not mirrored:
+                verdict, why = "CANNOT TRIGGER", "no ngit mirror (no kind-30617 announcement)"
+            elif not wfs:
+                verdict, why = "CANNOT RUN CI", "mirror exists but no .ngit/act/workflows/ at HEAD"
+            else:
+                verdict, why = "OK", f"{len(wfs)} workflow file(s)"
         rows.append(
             {
                 "repo": slug,
-                "ngit_repo_id": repo_id if mirrored else None,
-                "mirror": mirrored,
+                "visibility": gate.visibility,
+                "public": gate.allowed,
+                "ngit_repo_id": repo_id if (mirrored and gate.allowed) else None,
+                "mirror": mirrored and gate.allowed,
                 "workflows": wfs or [],
                 "verdict": verdict,
                 "reason": why,
@@ -92,21 +108,35 @@ def main(argv: list[str]) -> int:
         )
 
     width = max(len(r["repo"]) for r in rows)
+    vwidth = max(len(r["visibility"]) for r in rows)
+    print(f"{'repo':<{width}}  {'visibility':<{vwidth}}  {'verdict':<14} mirror  reason")
     for row in rows:
-        colour = {"OK": GREEN, "CANNOT RUN CI": YELLOW, "CANNOT TRIGGER": RED}[row["verdict"]]
+        colour = {
+            "OK": GREEN,
+            "CANNOT RUN CI": YELLOW,
+            "CANNOT TRIGGER": RED,
+            SKIP_NOT_PUBLIC: RED,
+        }[row["verdict"]]
         print(
-            f"{row['repo']:<{width}}  {colour}{row['verdict']:<14}{RESET} "
+            f"{row['repo']:<{width}}  {row['visibility']:<{vwidth}}  "
+            f"{colour}{row['verdict']:<14}{RESET} "
             f"mirror={'yes' if row['mirror'] else 'no ':<3} "
             f"{row['reason']}"
         )
 
     ok = sum(1 for r in rows if r["verdict"] == "OK")
+    not_public = [r for r in rows if not r["public"]]
     print(
         f"\n{len(rows)} configured repos | "
         f"{ok} fully triggerable | "
         f"{sum(1 for r in rows if r['mirror'])} mirrored | "
-        f"{sum(1 for r in rows if not r['mirror'])} without an ngit mirror"
+        f"{sum(1 for r in rows if not r['mirror'])} without an ngit mirror | "
+        f"{len(not_public)} skipped (not public)"
     )
+    if not_public:
+        print("SKIPPED (not public): " + ", ".join(f"{r['repo']}={r['visibility']}" for r in not_public))
+    else:
+        print("all configured repos are public")
     if args.json:
         Path(args.json).write_text(json.dumps(rows, indent=2))
         print(f"json written to {args.json}")

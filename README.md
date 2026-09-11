@@ -25,16 +25,35 @@ so commits authored or pushed by `felixfelix-bot`, `c03rad0r`, `Amperstrand`,
 coordinator. The bridge publishes the ref to the repo's ngit mirror, which emits
 the 30618 the coordinator already listens for.
 
+## Public-only gate (security invariant)
+
+Nostr relays are public and permanent: a mirror push (kind-30618) and a repo
+announcement (kind-30617) cannot be revoked. **Only GitHub repositories whose
+visibility is exactly `public` may be mirrored or announced.** The gate is
+implemented once in `public_only.py` and is **fail-closed**: `private`,
+`internal`, an unknown/empty value, NOT-FOUND, a timeout and any API error all
+deny. See [`SECURITY.md`](SECURITY.md).
+
+It is enforced at config load (a `repo -> visibility -> verdict` table is
+printed and non-public entries are reported and skipped, never silently removed
+from `config.json`) and again immediately before every clone, ngit push and
+kind-9840 publish. A repo that fails the gate is a *permanent skip for that
+tick* — logged with its observed visibility, never recorded as a retryable
+failure, and re-evaluated on the next tick.
+
 ## Files
 
 | file | purpose |
 |------|---------|
 | `bridge.py` | the poller: discovery, decision, trigger, lock, logging |
 | `decision.py` | pure decision logic (unit-tested, no I/O) |
+| `public_only.py` | fail-closed public-only gate (`gh api ... --jq .visibility`) |
 | `nostr_event.py` | signs an event with the key in `key_file` — key never enters argv |
 | `config.json` | committed config: identities, orgs/repos, relays, intervals. No secrets |
-| `audit.py` | reports, per watched repo, whether a CI run is even possible (mirror? workflows?) |
+| `audit.py` | reports, per watched repo, its GitHub visibility and whether a CI run is possible |
+| `SECURITY.md` | the invariant: public GitHub repos only, fail-closed |
 | `tests/test_decision.py` | unit tests for the decision matrix |
+| `tests/test_public_only.py` | unit tests for the public-only gate |
 | `systemd/*` | user timer + service (every 5 minutes) |
 | `install.sh` | installs and enables the timer |
 | `.ngit/act/workflows/bridge-smoke.yml` | the repo's own ngit-CI workflow |
@@ -73,7 +92,8 @@ python3 bridge.py --dry-run --repo OpenTollGate/tollgate-module-basic-go \
                   --sha <sha>                    # classify one specific commit
 python3 bridge.py --refresh-mirrors              # re-read kind-30617 announcements now
 python3 bridge.py --repo owner/name              # real run, one repo only
-python3 audit.py                                 # what can trigger CI today, per repo
+python3 audit.py                                 # visibility + triggerability, per repo
+make test                                        # unit tests (decision + public-only gate)
 ```
 
 Exit codes: `0` ok, `2` runtime error, `3` another tick holds the lock,

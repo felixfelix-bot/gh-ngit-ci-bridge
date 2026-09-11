@@ -6,16 +6,16 @@ SIGNER ?= /opt/miniconda/bin/python3
 PYTEST ?= pytest
 CONFIG ?= config.json
 
-.PHONY: help test dry once install logs lint
+.PHONY: help test dry once install logs lint signer-check audit
 
 help:
 	@grep -E '^[a-z-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN{FS=":.*?## "}{printf "  \033[36m%-10s\033[0m %s\n", $$1, $$2}'
 
-test:  ## run the decision-logic unit tests
-	$(PYTEST) -q tests/test_decision.py
+test:  ## run the unit tests (decision matrix + public-only gate)
+	$(PYTEST) -q tests/
 
 lint:  ## byte-compile every module
-	$(PY) -m py_compile bridge.py decision.py nostr_event.py tests/test_decision.py
+	$(PY) -m py_compile bridge.py decision.py public_only.py nostr_event.py audit.py tests/test_decision.py tests/test_public_only.py
 	@echo "compile ok"
 
 dry:  ## classify only: no publishes, no state changes
@@ -23,6 +23,9 @@ dry:  ## classify only: no publishes, no state changes
 
 once:  ## one real tick
 	$(PY) bridge.py --config $(CONFIG)
+
+audit:  ## per-repo visibility + triggerability report
+	$(PY) audit.py --config $(CONFIG)
 
 install:  ## install + enable the systemd user timer
 	./install.sh
