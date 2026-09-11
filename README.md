@@ -41,6 +41,70 @@ kind-9840 publish. A repo that fails the gate is a *permanent skip for that
 tick* — logged with its observed visibility, never recorded as a retryable
 failure, and re-evaluated on the next tick.
 
+## Kalman-driven coordinator concurrency (`NGIT_CI_MAX_CONCURRENT_JOBS`)
+
+`ci_concurrency_controller.py` (unit-tested logic in `ci_concurrency.py`) sets
+the ngit-ci coordinator's concurrency from **the same resource-pressure Kalman
+signal the dispatcher already uses to decide how many dispatches are possible**.
+It is not a second predictor: it reads the folded headroom the dispatcher
+publishes and re-scales it onto the coordinator's `[1..3]` range.
+
+```
+dispatcher (gateway/kanban_watchers.py)
+  _compute_dispatch_headroom()
+    6-state resource Kalman (multi_resource_kalman) early-warning  ─┐
+    raw resource pressure (RAM / load / swap / disk)               ├─> min() -> target_workers
+    LLM quota gate (/v1/dispatch_gate)                            ─┘
+  persisted to ~/.hermes/bot/dispatch_headroom.json
+        │
+        ▼
+ci_concurrency_controller.py  ── f = min(per_dimension) ──> limit = clamp(1 + f*(3-1), 1, 3)
+        │                       (capacity clamp: min(limit, target_workers); never < 1)
+        ▼  only when the coordinator is provably idle
+   ~/ngit-ci-deploy/.env  NGIT_CI_MAX_CONCURRENT_JOBS=N  +  docker compose up -d coordinator
+```
+
+| signal | meaning | limit |
+|--------|---------|-------|
+| `min(per_dimension) >= 0.75` | every resource has headroom | 3 |
+| `0.25 <= min < 0.75` | a dimension is throttled (or the Kalman predicts a breach) | 2 |
+| `min < 0.25`, incl. any dimension at `0.0` | a resource is critical | 1 |
+
+The floor is 1: the dispatcher may stop dispatching entirely (`target_workers=0`),
+but the CI coordinator always keeps one slot. The hard cap is 3 (a recorded
+decision: 3 x 4 GB job ceilings against 10.9 GB of RAM).
+
+Behaviour:
+
+* **idempotent** — same limit as the live `.env` value means *no recreate* (the
+  coordinator container is only touched when the number actually changes);
+* **idle-gated** — a change recreates the coordinator, which kills an in-flight
+  job, so the controller applies only when it can *prove* the coordinator is
+  idle (no trigger started-but-unfinished in the log, no fresh `act-*` job
+  container in the dind daemon, no fresh enqueue) and re-checks idle
+  immediately before applying; otherwise it defers to the next tick;
+* **override** — `echo 2 > ~/.local/state/gh-ngit-ci-bridge/ci-concurrency.override`
+  (or `KALMAN_CI_CONCURRENCY_PIN=2`, or `--override 2`) pins the value; the pin
+  is respected and logged;
+* **dry-run** — `--dry-run` decides and logs, applies nothing;
+* **auditable** — every tick appends one JSON line to
+  `~/.local/state/gh-ngit-ci-bridge/ci-concurrency.log` with the signal value,
+  the computed limit, the previous limit, the action and the reason. No key
+  material is read or written by this program.
+
+```bash
+make concurrency-test      # unit tests for the mapping / idle detection
+make concurrency-dry       # decide against the live signal, apply nothing
+make concurrency-once      # one real tick
+make concurrency-install   # install + enable the 5-minute systemd user timer
+```
+
+Useful flags: `--max-limit`, `--signal-ceiling`, `--dimensions cpu_load,memory_pct`
+(CI jobs consume neither LLM quota nor the dispatch host's disk; folding those
+dimensions in is faithful to the dispatcher but can hold CI concurrency down for
+reasons CI does not cause), `--dq05-mem-floor-mb`, `--force-recreate` (skip the
+idle check — dangerous), `--json`.
+
 ## Files
 
 | file | purpose |
@@ -54,8 +118,12 @@ failure, and re-evaluated on the next tick.
 | `SECURITY.md` | the invariant: public GitHub repos only, fail-closed |
 | `tests/test_decision.py` | unit tests for the decision matrix |
 | `tests/test_public_only.py` | unit tests for the public-only gate |
-| `systemd/*` | user timer + service (every 5 minutes) |
-| `install.sh` | installs and enables the timer |
+| `ci_concurrency.py` | pure mapping: Kalman headroom -> concurrency limit, idle classification, dotenv patching |
+| `ci_concurrency_controller.py` | the controller: read signal, compare, apply only when idle, log every decision |
+| `systemd/gh-ngit-ci-bridge.*` | bridge user timer + service (every 5 minutes) |
+| `systemd/kalman-ci-concurrency.*` | concurrency user timer + service (every 5 minutes) |
+| `install.sh` | installs and enables the bridge timer |
+| `install-ci-concurrency.sh` | installs and enables the concurrency timer |
 | `.ngit/act/workflows/bridge-smoke.yml` | the repo's own ngit-CI workflow |
 
 ## Hard-won lessons about git-remote-nostr (read before touching the push path)

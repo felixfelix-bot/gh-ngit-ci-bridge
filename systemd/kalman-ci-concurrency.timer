@@ -1,0 +1,22 @@
+[Unit]
+Description=Run kalman-ci-concurrency every 5 minutes
+
+# Interval justification (5 min):
+#  * the resource-pressure signal moves on a minutes timescale: the dispatcher
+#    rewrites dispatch_headroom.json on its own dispatch tick, and the 6-state
+#    resource Kalman warns ~30 minutes ahead of a threshold breach;
+#  * every CHANGE recreates the coordinator container (killing any in-flight
+#    job), so the controller wants a wide, calm sampling interval, not a fast
+#    one: 5 min gives many quiet windows and still reacts well inside the
+#    Kalman's 30 min early-warning horizon;
+#  * it matches the gh-ngit-ci-bridge timer, so both halves of the pipeline tick
+#    on the same cadence and their logs line up.
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=5min
+AccuracySec=30s
+Persistent=true
+Unit=kalman-ci-concurrency.service
+
+[Install]
+WantedBy=timers.target

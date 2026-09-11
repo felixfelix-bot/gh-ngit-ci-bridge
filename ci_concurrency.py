@@ -107,6 +107,18 @@ class Signal:
     source: str = ""  # where the numbers came from (path or "env:...")
     ts: float | None = None  # daemon tick timestamp (epoch seconds)
     age_s: float | None = None  # now - ts, when known
+    #: True when the file carried its own timestamp; False when we fell back to
+    #: the file's mtime (a source without a tick timestamp is less trustworthy
+    #: than one that publishes when it last ran).
+    ts_explicit: bool = True
+    #: Per-dimension resource headroom as published by the dispatcher's
+    #: ``_compute_dispatch_headroom`` fold (Kalman early-warning + raw pressure
+    #: + LLM gate). 0.0 = dimension critical, 1.0 = full headroom.
+    per_dimension: Mapping[str, float] = field(default_factory=dict)
+    #: ``min(per_dimension)`` as published (all dimensions).
+    headroom: float | None = None
+    #: ``target_workers``-style capacity count, when the source publishes one.
+    capacity: float | None = None
 
     def as_dict(self) -> dict:
         return {
@@ -117,6 +129,10 @@ class Signal:
             "max_concurrent": self.max_concurrent,
             "source": self.source,
             "tick_age_s": None if self.age_s is None else round(self.age_s, 1),
+            "tick_ts_explicit": self.ts_explicit,
+            "headroom": None if self.headroom is None else round(self.headroom, 4),
+            "capacity": self.capacity,
+            "per_dimension": {k: round(float(v), 4) for k, v in dict(self.per_dimension).items()},
         }
 
 
@@ -155,35 +171,89 @@ def compute_limit(
     velocity_weight: float = 0.0,
     dq05_avail_mb: int | None = None,
     dq05_mem_floor_mb: int = DEFAULT_DQ05_MEM_FLOOR_MB,
+    dimensions: Sequence[str] | None = None,
 ) -> tuple[int, float, list[str]]:
-    """Map the Kalman signal to an integer concurrency limit in [1..max_limit].
+    """Map the Kalman resource-pressure signal to an integer limit in [1..max].
 
     Returns ``(limit, headroom_fraction, notes)``.
+
+    Three source shapes, in order of fidelity to the dispatcher's own fold:
+
+    1. ``per_dimension`` published by ``_compute_dispatch_headroom`` — the same
+       Kalman-informed headroom the dispatcher folds into ``target_workers``.
+       We fold it the same way: the fleet is limited by the *minimum* dimension.
+    2. a bare ``headroom`` fraction.
+    3. a smoothed/raw capacity count on the host's pool scale, normalised
+       against the host ceiling (the daemon's / the assigner's mirror).
     """
     notes: list[str] = []
+    fraction: float | None = None
 
-    fraction = headroom_fraction(
-        signal.pool_smoothed,
-        signal.ceiling,
-        velocity=signal.velocity,
-        velocity_weight=velocity_weight,
-    )
-    limit = capacity_to_limit(fraction, min_limit, max_limit)
-    notes.append(
-        f"kalman smoothed pool {signal.pool_smoothed:.2f}/{signal.ceiling:g} "
-        f"-> headroom {fraction:.2f} -> {limit}"
-    )
+    per_dim = dict(signal.per_dimension or {})
+    if per_dim:
+        selected = {
+            k: float(v)
+            for k, v in per_dim.items()
+            if not dimensions or k in dimensions
+        }
+        if selected:
+            fraction = _clamp01(min(selected.values()))
+            notes.append(
+                "dispatcher headroom: min over "
+                f"{sorted(selected)} = {fraction:.2f} "
+                f"(all dimensions: { {k: round(v, 2) for k, v in per_dim.items()} })"
+            )
+        else:
+            notes.append(
+                f"no requested dimension present in {sorted(per_dim)} — "
+                "falling back to the capacity scale"
+            )
 
-    # Fail-safe clamp on the *unsmoothed* capacity: smoothing must not paper
-    # over a tick that actually measured pressure.
-    raw_fraction = headroom_fraction(signal.pool_raw, signal.ceiling)
-    raw_limit = capacity_to_limit(raw_fraction, min_limit, max_limit)
-    if raw_limit < limit:
-        notes.append(
-            f"raw capacity clamp: raw pool {signal.pool_raw:.2f} "
-            f"(headroom {raw_fraction:.2f}) caps {limit} -> {raw_limit}"
+    if fraction is None and signal.headroom is not None:
+        fraction = _clamp01(signal.headroom)
+        notes.append(f"published headroom {fraction:.2f}")
+
+    if fraction is None:
+        fraction = headroom_fraction(
+            signal.pool_smoothed,
+            signal.ceiling,
+            velocity=signal.velocity,
+            velocity_weight=velocity_weight,
         )
-        limit = raw_limit
+        notes.append(
+            f"kalman smoothed pool {signal.pool_smoothed:.2f}/{signal.ceiling:g} "
+            f"-> headroom {fraction:.2f}"
+        )
+
+    limit = capacity_to_limit(fraction, min_limit, max_limit)
+    notes.append(f"headroom {fraction:.2f} -> limit {limit}")
+
+    # Explicit capacity count ("how many dispatches are possible") as an upper
+    # clamp, when the source publishes one.
+    if signal.capacity is not None:
+        cap_limit = int(
+            max(
+                int(min_limit),
+                min(int(max_limit), _round_half_up(float(signal.capacity))),
+            )
+        )
+        if cap_limit < limit:
+            notes.append(
+                f"capacity clamp: published capacity {signal.capacity:g} caps {limit} -> {cap_limit}"
+            )
+            limit = cap_limit
+
+    # Fail-safe clamp on the *unsmoothed* capacity, only meaningful on the
+    # pool scale: smoothing must not paper over a tick that measured pressure.
+    if fraction is not None and not per_dim and signal.headroom is None:
+        raw_fraction = headroom_fraction(signal.pool_raw, signal.ceiling)
+        raw_limit = capacity_to_limit(raw_fraction, min_limit, max_limit)
+        if raw_limit < limit:
+            notes.append(
+                f"raw capacity clamp: raw pool {signal.pool_raw:.2f} "
+                f"(headroom {raw_fraction:.2f}) caps {limit} -> {raw_limit}"
+            )
+            limit = raw_limit
 
     if dq05_avail_mb is not None and dq05_avail_mb < dq05_mem_floor_mb:
         notes.append(
@@ -259,6 +329,7 @@ def decide(
     velocity_weight: float = 0.0,
     dq05_avail_mb: int | None = None,
     dq05_mem_floor_mb: int = DEFAULT_DQ05_MEM_FLOOR_MB,
+    dimensions: Sequence[str] | None = None,
 ) -> Decision:
     """Decide what to do this tick. Pure: no side effects."""
     limit, fraction, notes = compute_limit(
@@ -268,6 +339,7 @@ def decide(
         velocity_weight=velocity_weight,
         dq05_avail_mb=dq05_avail_mb,
         dq05_mem_floor_mb=dq05_mem_floor_mb,
+        dimensions=dimensions,
     )
 
     pinned, override_note = resolve_override(override, min_limit=min_limit, max_limit=max_limit)

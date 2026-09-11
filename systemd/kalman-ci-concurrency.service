@@ -1,0 +1,22 @@
+[Unit]
+Description=kalman-ci-concurrency - drive NGIT_CI_MAX_CONCURRENT_JOBS on DQ05 from the dispatch Kalman resource-pressure signal
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/c03rad0r/repos/gh-ngit-ci-bridge
+# ssh must be on PATH and HOME set so the probe reaches DQ05 and the Kalman
+# state files under ~/.hermes resolve. systemd user units start with a minimal
+# environment.
+Environment=HOME=/home/c03rad0r
+Environment=PATH=/home/c03rad0r/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 /home/c03rad0r/repos/gh-ngit-ci-bridge/ci_concurrency_controller.py --quiet
+# 0 = tick completed (apply | noop | defer | dry-run). A non-zero exit means we
+# could not even decide (no fresh signal / unreadable state) - that is a real
+# failure and must be visible.
+SuccessExitStatus=0
+StandardOutput=journal
+StandardError=journal
+Nice=10

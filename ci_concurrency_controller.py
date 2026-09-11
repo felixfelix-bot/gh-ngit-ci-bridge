@@ -56,6 +56,33 @@ from ci_concurrency import (  # noqa: E402
 
 DEFAULT_STATE_FILE = "~/.hermes/state/adaptive-dispatch.state"
 DEFAULT_FALLBACK_STATE = "~/.hermes/bot/adaptive_max_in_progress.json"
+#: Instances of the SAME resource-pressure Kalman capacity decision, freshest
+#: wins:
+#:   * ``dispatch_headroom.json`` — written by the dispatcher's
+#:     ``_compute_dispatch_headroom()`` (gateway/kanban_watchers.py), which folds
+#:     the 6-state resource Kalman (multi_resource_kalman: memory/cpu/swap/disk/
+#:     tokens/workers) early-warning together with the current raw resource
+#:     pressure and the LLM quota gate into ``target_workers`` — literally "how
+#:     many dispatches are possible right now";
+#:   * ``adaptive-dispatch.state`` — the dispatch daemon's Kalman-smoothed pool
+#:     capacity (the same quantity, published while that daemon runs);
+#:   * ``adaptive_max_in_progress.json`` — the kanban assigner's mirror of it.
+#:
+#: Deliberately NOT in this list: ~/.hermes/bot/pool_kalman.json. That file is a
+#: *worker-pool count* filter (its measurement is a live worker count), not
+#: resource pressure — it was observed decaying to ~0.0 on an idle, healthy
+#: host, which this mapping would read as maximum pressure and would pin
+#: concurrency at 1 forever.
+DEFAULT_SIGNAL_SOURCES = (
+    "~/.hermes/bot/dispatch_headroom.json",
+    "~/.hermes/state/adaptive-dispatch.state",
+    "~/.hermes/bot/adaptive_max_in_progress.json",
+)
+#: The daemon's own capacity function. Available as an explicit opt-in
+#: (``--readonly-probe``) but NOT used by default: ``compute_max_workers.py``
+#: clamps its own answer up to ``SAFE_MAX_WORKERS=2``, so it returns 2 under
+#: any pressure and therefore carries almost no signal.
+DEFAULT_CAPACITY_PROBE = "~/.hermes/profiles/manager/scripts/compute_max_workers.py"
 DEFAULT_OVERRIDE_FILE = "~/.local/state/gh-ngit-ci-bridge/ci-concurrency.override"
 DEFAULT_LOG_FILE = "~/.local/state/gh-ngit-ci-bridge/ci-concurrency.log"
 DEFAULT_SSH_TARGET = "dq05"
@@ -228,61 +255,272 @@ def read_signal(
     now = time.time() if now is None else now
     path = Path(os.path.expanduser(str(state_file)))
     if path.exists():
-        text = path.read_text(errors="replace")
-        kv = parse_kv_state(text)
-        if "SMOOTHED_POOL" in kv:
-            try:
-                smoothed = float(kv["SMOOTHED_POOL"])
-            except ValueError as exc:
-                raise RuntimeError(f"{path}: SMOOTHED_POOL not a number ({exc})") from exc
-            raw = kv.get("POOL_RAW")
-            try:
-                raw_f = float(raw) if raw is not None else smoothed
-            except ValueError:
-                raw_f = smoothed
-            vel = kv.get("VELOCITY")
-            try:
-                vel_f = float(vel) if vel is not None else 0.0
-            except ValueError:
-                vel_f = 0.0
-            mc = kv.get("MAX_CONCURRENT")
-            try:
-                mc_f = float(mc) if mc is not None else None
-            except ValueError:
-                mc_f = None
-            ts = kv.get("TS")
-            try:
-                ts_f = float(ts) if ts is not None else None
-            except ValueError:
-                ts_f = None
-            return Signal(
-                pool_smoothed=smoothed,
-                pool_raw=raw_f,
-                ceiling=ceiling,
-                velocity=vel_f,
-                max_concurrent=mc_f,
-                source=str(path),
-                ts=ts_f,
-                age_s=None if ts_f is None else now - ts_f,
-            )
+        sig = parse_source_file(path, ceiling, now=now)
+        if sig is not None:
+            return sig
     fb = Path(os.path.expanduser(str(fallback_file)))
     if fb.exists():
-        try:
-            data = json.loads(fb.read_text() or "{}")
-        except json.JSONDecodeError as exc:
-            raise RuntimeError(f"{fb}: not valid JSON ({exc})") from exc
-        if "max_in_progress" in data:
-            mc = float(data["max_in_progress"])
-            raw = float(data.get("raw", mc))
-            return Signal(
-                pool_smoothed=mc,
-                pool_raw=raw,
-                ceiling=ceiling,
-                max_concurrent=mc,
-                source=str(fb),
-            )
+        sig = parse_source_file(fb, ceiling, now=now)
+        if sig is not None:
+            return sig
     raise RuntimeError(
         f"no Kalman signal available: neither {path} nor {fb} carries a usable pool value"
+    )
+
+
+def parse_source_file(path: Path, ceiling: float, *, now: float | None = None) -> Signal | None:
+    """Parse one candidate signal file, whatever shape that instance uses.
+
+    Shapes seen in production (all outputs of the same existing filter):
+      * ``adaptive-dispatch.state``  KEY=VALUE, ``SMOOTHED_POOL``/``POOL_RAW``/``TS``
+      * ``pool_kalman.json``         ``{"x": [pool, velocity], "ts": epoch}``
+      * ``adaptive_max_in_progress.json`` ``{"max_in_progress": N, "raw": N}``
+    """
+    now = time.time() if now is None else now
+    try:
+        text = path.read_text(errors="replace")
+    except OSError:
+        return None
+    if not text.strip():
+        return None
+
+    ts: float | None = None
+    _ts_explicit = False
+    smoothed: float
+    raw: float | None = None
+    velocity = 0.0
+    max_concurrent: float | None = None
+
+    stripped = text.lstrip()
+    if stripped.startswith("{") or stripped.startswith("["):
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(data, dict):
+            return None
+        if "x" in data and isinstance(data.get("x"), (list, tuple)) and data["x"]:
+            try:
+                smoothed = float(data["x"][0])
+                velocity = float(data["x"][1]) if len(data["x"]) > 1 else 0.0
+            except (TypeError, ValueError):
+                return None
+            raw = float(data.get("raw", smoothed))
+            max_concurrent = float(data.get("max_concurrent", round(smoothed)))
+        elif "max_in_progress" in data:
+            try:
+                smoothed = float(data["max_in_progress"])
+                raw = float(data.get("raw", smoothed))
+            except (TypeError, ValueError):
+                return None
+            max_concurrent = smoothed
+        elif "smoothed_pool" in data:
+            try:
+                smoothed = float(data["smoothed_pool"])
+                raw = float(data.get("raw_pool", smoothed))
+            except (TypeError, ValueError):
+                return None
+            velocity = float(data.get("velocity", 0.0) or 0.0)
+            max_concurrent = float(data.get("max_concurrent", round(smoothed)))
+        elif "per_dimension" in data or "target_workers" in data:
+            # dispatch_headroom.json — the dispatcher's own folded headroom.
+            dims = data.get("per_dimension") or {}
+            try:
+                per_dim = {
+                    str(k): float(v)
+                    for k, v in dims.items()
+                    if isinstance(v, (int, float)) and not isinstance(v, bool)
+                }
+            except (TypeError, ValueError):
+                return None
+            capacity = data.get("target_workers")
+            try:
+                cap_f = float(capacity) if capacity is not None else None
+            except (TypeError, ValueError):
+                cap_f = None
+            if not per_dim and cap_f is None:
+                return None
+            smoothed = float(cap_f) if cap_f is not None else min(per_dim.values())
+            raw = smoothed
+            headroom = min(per_dim.values()) if per_dim else None
+            return Signal(
+                pool_smoothed=smoothed,
+                pool_raw=raw,
+                ceiling=ceiling,
+                per_dimension=per_dim,
+                headroom=headroom,
+                capacity=cap_f,
+                max_concurrent=cap_f,
+                source=str(path),
+                ts=path.stat().st_mtime,
+                age_s=now - path.stat().st_mtime,
+                ts_explicit=False,
+            )
+        else:
+            return None
+        for key in ("ts", "updated_at", "generated_ts"):
+            if data.get(key) is not None:
+                try:
+                    ts = float(data[key])
+                    _ts_explicit = True
+                    break
+                except (TypeError, ValueError):
+                    continue
+    else:
+        kv = parse_kv_state(text)
+        if "SMOOTHED_POOL" not in kv:
+            return None
+        try:
+            smoothed = float(kv["SMOOTHED_POOL"])
+        except ValueError:
+            return None
+        try:
+            raw = float(kv["POOL_RAW"]) if kv.get("POOL_RAW") is not None else smoothed
+        except ValueError:
+            raw = smoothed
+        try:
+            velocity = float(kv.get("VELOCITY", 0.0) or 0.0)
+        except ValueError:
+            velocity = 0.0
+        try:
+            max_concurrent = float(kv["MAX_CONCURRENT"]) if kv.get("MAX_CONCURRENT") is not None else None
+        except ValueError:
+            max_concurrent = None
+        try:
+            ts = float(kv["TS"]) if kv.get("TS") is not None else None
+            _ts_explicit = ts is not None
+        except ValueError:
+            ts = None
+
+    if ts is None:
+        try:
+            ts = path.stat().st_mtime
+        except OSError:
+            ts = None
+    ts_explicit = _ts_explicit
+
+    return Signal(
+        pool_smoothed=smoothed,
+        pool_raw=raw if raw is not None else smoothed,
+        ceiling=ceiling,
+        velocity=velocity,
+        max_concurrent=max_concurrent,
+        source=str(path),
+        ts=ts,
+        age_s=None if ts is None else now - ts,
+        ts_explicit=ts_explicit,
+    )
+
+
+def read_signal_auto(
+    sources: "list[str] | tuple[str, ...]",
+    ceiling: float,
+    *,
+    now: float | None = None,
+    max_age_s: float | None = None,
+) -> tuple[Signal, list[str]]:
+    """Pick the FRESHEST usable signal file out of every known instance.
+
+    All candidates are outputs of the same existing resource-pressure Kalman
+    filter (the dispatch daemon's pool state, its smoothed capacity state, and
+    the assigner's max-in-progress mirror). Which one is live depends on which
+    component is running, so freshness decides. Returns ``(signal, notes)``.
+    """
+    now = time.time() if now is None else now
+    notes: list[str] = []
+    candidates: list[Signal] = []
+    for src in sources:
+        path = Path(os.path.expanduser(str(src)))
+        if not path.exists():
+            notes.append(f"absent: {path}")
+            continue
+        sig = parse_source_file(path, ceiling, now=now)
+        if sig is None:
+            notes.append(f"unusable (no pool value): {path}")
+            continue
+        age = "" if sig.age_s is None else f", age {sig.age_s / 60:.1f} min"
+        notes.append(f"candidate: {path} pool={sig.pool_smoothed:.3f}{age}")
+        if max_age_s is not None and sig.age_s is not None and sig.age_s > max_age_s:
+            continue
+        candidates.append(sig)
+    if not candidates:
+        raise RuntimeError(
+            "no fresh Kalman signal among: " + "; ".join(notes or ["(none configured)"])
+        )
+    # Freshest first (age from the file's own tick timestamp, else its mtime);
+    # a source that publishes its own timestamp wins a tie, then configured
+    # priority. The point is the *signal*, not the layout: whichever component
+    # is actually running right now is the one whose reading is actionable.
+    def _rank(s: Signal) -> tuple:
+        age = s.age_s if s.age_s is not None else float("inf")
+        return (
+            round(age, 1),
+            0 if s.ts_explicit else 1,
+            sources.index(s.source) if s.source in sources else len(sources),
+        )
+
+    candidates.sort(key=_rank)
+    chosen = candidates[0]
+    notes.append(f"chose freshest: {chosen.source}")
+    return chosen, notes
+
+
+def probe_capacity_readonly(
+    probe_path: str | Path,
+    ceiling: float,
+    *,
+    now: float | None = None,
+    runner=None,
+    timeout: int = 30,
+) -> tuple[Signal | None, str]:
+    """Run the daemon's own capacity function read-only and use its answer.
+
+    Same estimator, same inputs, no dispatch side effects: this is the fallback
+    for when the dispatch daemon is stopped (nothing publishes its smoothed
+    pool). The probe prints one integer; with the daemon's pool smoother absent
+    the daemon itself also falls back to this raw capacity, so the two agree.
+    """
+    now = time.time() if now is None else now
+    path = Path(os.path.expanduser(str(probe_path)))
+    if not path.exists():
+        return None, f"capacity probe not found: {path}"
+    runner = runner or subprocess.run
+    try:
+        proc = runner(
+            [sys.executable, str(path), "--verbose"],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        return None, f"capacity probe failed: {exc}"
+    out = (proc.stdout or "").strip().splitlines()
+    value: float | None = None
+    for line in reversed(out):
+        line = line.strip()
+        if line.isdigit():
+            value = float(line)
+            break
+    if value is None:
+        return None, f"capacity probe produced no integer (stdout={proc.stdout!r})"
+    if value > ceiling:
+        value = ceiling
+    detail = " | ".join((proc.stderr or "").strip().splitlines())
+    note = f"read-only capacity probe {path} -> {value:.0f}"
+    if detail:
+        note += f" [{detail}]"
+    return (
+        Signal(
+            pool_smoothed=value,
+            pool_raw=value,
+            ceiling=ceiling,
+            velocity=0.0,
+            max_concurrent=value,
+            source=f"probe:{path}",
+            ts=now,
+            age_s=0.0,
+        ),
+        note,
     )
 
 
@@ -311,9 +549,36 @@ def build_argparser() -> argparse.ArgumentParser:
     ap.add_argument("--dry-run", action="store_true", help="decide + log, apply nothing")
     ap.add_argument("--force-recreate", action="store_true", help="skip the idle check (dangerous)")
     ap.add_argument("--override", type=int, default=None, help="pin the limit for this tick")
-    ap.add_argument("--state-file", default=DEFAULT_STATE_FILE)
+    ap.add_argument("--state-file", default=None, help="pin one signal file (default: freshest of --signal-sources)")
     ap.add_argument("--fallback-state-file", default=DEFAULT_FALLBACK_STATE)
+    ap.add_argument(
+        "--signal-sources",
+        default=os.environ.get("KALMAN_CI_SIGNAL_SOURCES", ",".join(DEFAULT_SIGNAL_SOURCES)),
+        help="comma-separated candidate signal files; the freshest usable one wins",
+    )
     ap.add_argument("--override-file", default=DEFAULT_OVERRIDE_FILE)
+    ap.add_argument(
+        "--capacity-probe",
+        default=os.environ.get("KALMAN_CI_CAPACITY_PROBE", DEFAULT_CAPACITY_PROBE),
+        help="the daemon's own capacity function, used read-only when no fresh Kalman state exists",
+    )
+    ap.add_argument(
+        "--readonly-probe",
+        dest="allow_readonly_probe",
+        action="store_true",
+        help=(
+            "if no published Kalman state is fresh, run compute_max_workers.py read-only "
+            "(off by default: it clamps itself to SAFE_MAX_WORKERS and carries little signal)"
+        ),
+    )
+    ap.add_argument(
+        "--dimensions",
+        default=os.environ.get("KALMAN_CI_DIMENSIONS", ""),
+        help=(
+            "comma-separated subset of headroom dimensions to fold (default: all published, "
+            "exactly like the dispatcher). e.g. cpu_load,memory_pct,swap_used_pct"
+        ),
+    )
     ap.add_argument("--log-file", default=DEFAULT_LOG_FILE)
     ap.add_argument("--ssh-target", default=os.environ.get("KALMAN_CI_SSH_TARGET", DEFAULT_SSH_TARGET))
     ap.add_argument("--signal-ceiling", type=float, default=float(os.environ.get("KALMAN_CI_SIGNAL_CEILING", DEFAULT_SIGNAL_CEILING)))
@@ -351,15 +616,34 @@ def main(argv: list[str] | None = None) -> int:
     log_file = Path(os.path.expanduser(args.log_file))
     now = time.time()
 
+    signal_notes: list[str] = []
     try:
-        signal = read_signal(
-            args.state_file, args.fallback_state_file, args.signal_ceiling, now=now
-        )
+        if args.state_file:
+            signal = read_signal(
+                args.state_file, args.fallback_state_file, args.signal_ceiling, now=now
+            )
+            signal_notes.append(f"explicit signal file: {args.state_file}")
+        else:
+            sources = [s.strip() for s in str(args.signal_sources).split(",") if s.strip()]
+            try:
+                signal, signal_notes = read_signal_auto(
+                    sources, args.signal_ceiling, now=now, max_age_s=args.max_signal_age_s
+                )
+            except RuntimeError as exc:
+                if not args.allow_readonly_probe:
+                    raise
+                signal_notes = [str(exc)]
+                signal, probe_note = probe_capacity_readonly(
+                    args.capacity_probe, args.signal_ceiling, now=now
+                )
+                signal_notes.append(probe_note)
+                if signal is None:
+                    raise RuntimeError(probe_note) from exc
     except RuntimeError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
 
-    if signal.age_s is not None and signal.age_s > args.max_signal_age_s:
+    if args.state_file and signal.age_s is not None and signal.age_s > args.max_signal_age_s:
         print(
             f"ERROR: Kalman state is stale ({signal.age_s / 60:.1f} min old > "
             f"{args.max_signal_age_s / 60:.1f} min) — refusing to act",
@@ -370,6 +654,8 @@ def main(argv: list[str] | None = None) -> int:
     pinned, override_note = read_override(args.override_file, os.environ.get("KALMAN_CI_CONCURRENCY_PIN"))
     if args.override is not None:
         pinned, override_note = args.override, f"cli override ({args.override})"
+
+    dims = [d.strip() for d in str(args.dimensions).split(",") if d.strip()] or None
 
     dq = probe_dq05(args.ssh_target)
     if not dq.reachable:
@@ -384,6 +670,7 @@ def main(argv: list[str] | None = None) -> int:
             velocity_weight=args.velocity_weight,
             dq05_avail_mb=None,
             dq05_mem_floor_mb=args.dq05_mem_floor_mb,
+            dimensions=dims,
         )
         decision = dataclasses.replace(
             decision, reason=f"DQ05 unreachable: {dq.error}"
@@ -403,9 +690,10 @@ def main(argv: list[str] | None = None) -> int:
             velocity_weight=args.velocity_weight,
             dq05_avail_mb=dq.mem_available_mb,
             dq05_mem_floor_mb=args.dq05_mem_floor_mb,
+            dimensions=dims,
         )
 
-    extra: dict = {}
+    extra: dict = {"signal_notes": signal_notes}
     if dq.reachable:
         extra["dq05"] = {
             "compose_ps": dq.compose_ps.strip().replace("\n", "; "),
@@ -479,9 +767,15 @@ def main(argv: list[str] | None = None) -> int:
             f"smoothed={s['smoothed_pool']} raw={s['raw_pool']} ceiling={s['ceiling']} "
             f"headroom={decision.headroom:.2f} -> limit {record.previous_limit} -> {record.computed_limit}"
         )
+        print(f"  signal source: {s['source']} (tick age {s['tick_age_s']}s)")
+        if s.get("per_dimension"):
+            print(f"  signal headroom: min={s['headroom']} capacity(target_workers)={s['capacity']}")
+            print(f"  signal dimensions: {s['per_dimension']}")
         print(f"  reason: {record.reason}")
         for note in decision.notes:
             print(f"  note: {note}")
+        for note in signal_notes:
+            print(f"  signal: {note}")
         if record.idle is not None:
             print(f"  idle: {record.idle} ({record.idle_detail})")
         if apply_detail:

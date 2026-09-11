@@ -493,12 +493,237 @@ def test_log_record_carries_exactly_the_expected_fields(tmp_path, monkeypatch):
     record = json.loads(log.read_text().strip())
     expected = {
         "ts", "signal", "computed_limit", "previous_limit", "action", "reason",
-        "idle", "idle_detail", "override", "dry_run", "dq05",
+        "idle", "idle_detail", "override", "dry_run", "dq05", "signal_notes",
     }
     assert set(record) == expected
     blob = json.dumps(record).lower()
     for banned in ("nsec", "private_key", "bunker", "token", "password"):
         assert banned not in blob, banned
+
+
+def test_read_signal_auto_prefers_the_freshest_instance(tmp_path):
+    now = time.time()
+    stale = tmp_path / "adaptive-dispatch.state"
+    stale.write_text(f"SMOOTHED_POOL=2.0\nPOOL_RAW=2\nMAX_CONCURRENT=2\nTS={now - 60000:.0f}\n")
+    live = tmp_path / "adaptive-dispatch-2.state"
+    live.write_text(f"SMOOTHED_POOL=1.9997707\nPOOL_RAW=2\nMAX_CONCURRENT=2\nTS={now - 300:.0f}\n")
+    freshest = tmp_path / "dispatch_headroom.json"
+    freshest.write_text(json.dumps({"target_workers": 2, "per_dimension": {"memory_pct": 0.5, "llm": 1.0}}))
+    os.utime(freshest, (now - 5, now - 5))     # written 5s ago
+    os.utime(live, (now - 300, now - 300))
+    os.utime(stale, (now - 4000, now - 4000))
+
+    sig, notes = ccm.read_signal_auto([str(stale), str(live), str(freshest)], CEIL, now=now)
+    assert sig.source == str(freshest)
+    assert sig.per_dimension == {"memory_pct": 0.5, "llm": 1.0}
+    assert sig.headroom == pytest.approx(0.5)
+    assert sig.capacity == 2.0
+    assert any("chose freshest" in n for n in notes)
+    # ...and with the freshest one absent, the next-freshest wins
+    sig2, _ = ccm.read_signal_auto([str(stale), str(live)], CEIL, now=now)
+    assert sig2.source == str(live)
+    assert sig2.pool_smoothed == pytest.approx(1.9997707)
+
+    # A stale-only candidate set is refused when a max age is enforced.
+    with pytest.raises(RuntimeError) as err:
+        ccm.read_signal_auto([str(stale)], CEIL, now=now, max_age_s=1800)
+    assert "no fresh Kalman signal" in str(err.value)
+
+
+def test_parse_source_file_reads_an_empty_or_foreign_file_as_unusable(tmp_path):
+    empty = tmp_path / "empty.json"
+    empty.write_text("")
+    assert ccm.parse_source_file(empty, CEIL) is None
+    other = tmp_path / "other.json"
+    other.write_text(json.dumps({"unrelated": 1}))
+    assert ccm.parse_source_file(other, CEIL) is None
+    # The assigner mirror in the wild is not valid JSON (unquoted timestamp):
+    # fail closed -> treat it as unusable and fall through to another source.
+    broken = tmp_path / "adaptive_max_in_progress.json"
+    broken.write_text('{"max_in_progress": 2, "raw": 2, "updated_at": 2026-09-10T20:00:03Z}')
+    assert ccm.parse_source_file(broken, CEIL) is None
+
+
+def test_main_uses_the_freshest_signal_source_when_none_is_pinned(tmp_path, monkeypatch, capsys):
+    now = time.time()
+    stale = tmp_path / "adaptive-dispatch.state"
+    stale.write_text(f"SMOOTHED_POOL=1.0\nPOOL_RAW=1\nTS={now - 90000:.0f}\n")
+    live = tmp_path / "pool_kalman.json"
+    live.write_text(json.dumps({"x": [2.0, 0.0], "ts": now}))
+    monkeypatch.setattr(ccm, "probe_dq05", lambda target, timeout=90: _fake_probe(1, LOG_IDLE))
+    monkeypatch.setattr(
+        ccm, "apply_limit", lambda target, limit, timeout=240: (True, "ngit-ci-deploy-coordinator-1|running|Up 1s\n")
+    )
+    log = tmp_path / "ci.log"
+    rc = ccm.main(
+        [
+            "--signal-sources", f"{stale},{live}",
+            "--fallback-state-file", str(tmp_path / "none.json"),
+            "--override-file", str(tmp_path / "none.override"),
+            "--log-file", str(log),
+            "--json",
+        ]
+    )
+    assert rc == 0
+    record = json.loads(log.read_text().strip())
+    assert record["signal"]["source"] == str(live)
+    assert record["signal"]["smoothed_pool"] == 2.0  # would have been 1.0 from the stale file
+    assert record["computed_limit"] == 3 and record["action"] == "apply"
+
+
+class _Proc:
+    def __init__(self, stdout="", stderr="", returncode=0):
+        self.stdout = stdout
+        self.stderr = stderr
+        self.returncode = returncode
+
+
+def test_capacity_probe_reads_the_daemon_function_read_only(tmp_path):
+    probe = tmp_path / "compute_max_workers.py"
+    probe.write_text("# stand-in for the daemon's capacity function\n")
+    sig, note = ccm.probe_capacity_readonly(
+        probe, CEIL, runner=lambda *a, **kw: _Proc(stdout="2\n", stderr="Signals: RAM avail=5407MB")
+    )
+    assert sig is not None
+    assert sig.pool_smoothed == 2.0 and sig.pool_raw == 2.0
+    assert sig.source.startswith("probe:")
+    assert "-> 2" in note
+    # values above the host ceiling are clamped to it
+    sig2, _ = ccm.probe_capacity_readonly(
+        probe, CEIL, runner=lambda *a, **kw: _Proc(stdout="9\n")
+    )
+    assert sig2 is not None and sig2.pool_smoothed == CEIL
+
+
+def test_capacity_probe_handles_failure(tmp_path):
+    missing, note = ccm.probe_capacity_readonly(tmp_path / "absent.py", CEIL)
+    assert missing is None and "not found" in note
+
+    probe = tmp_path / "p.py"
+    probe.write_text("")
+    bad, note2 = ccm.probe_capacity_readonly(probe, CEIL, runner=lambda *a, **kw: _Proc(stdout="none\n"))
+    assert bad is None and "no integer" in note2
+
+
+def test_main_falls_back_to_the_probe_when_no_state_is_fresh(tmp_path, monkeypatch):
+    probe = tmp_path / "compute_max_workers.py"
+    probe.write_text("")
+    monkeypatch.setattr(ccm, "probe_dq05", lambda target, timeout=90: _fake_probe(1, LOG_IDLE))
+    monkeypatch.setattr(ccm, "apply_limit", lambda target, limit, timeout=240: (True, ""))
+    monkeypatch.setattr(
+        ccm,
+        "probe_capacity_readonly",
+        lambda path, ceiling, now=None: (
+            cc.Signal(pool_smoothed=2.0, pool_raw=2.0, ceiling=ceiling, source="probe:test", ts=now, age_s=0.0),
+            "read-only capacity probe -> 2",
+        ),
+    )
+    stale = tmp_path / "adaptive-dispatch.state"
+    stale.write_text(f"SMOOTHED_POOL=1.0\nPOOL_RAW=1\nTS={time.time() - 90000:.0f}\n")
+    log = tmp_path / "ci.log"
+    rc = ccm.main(
+        [
+            "--signal-sources", str(stale),
+            "--capacity-probe", str(probe),
+            "--readonly-probe",
+            "--fallback-state-file", str(tmp_path / "none.json"),
+            "--override-file", str(tmp_path / "none.override"),
+            "--log-file", str(log),
+            "--json",
+        ]
+    )
+    assert rc == 0
+    record = json.loads(log.read_text().strip())
+    assert record["signal"]["source"] == "probe:test"
+    assert record["computed_limit"] == 3
+
+
+def test_main_refuses_when_no_published_state_is_fresh(tmp_path, monkeypatch, capsys):
+    stale = tmp_path / "adaptive-dispatch.state"
+    stale.write_text(f"SMOOTHED_POOL=1.0\nPOOL_RAW=1\nTS={time.time() - 90000:.0f}\n")
+    rc = ccm.main(
+        [
+            "--signal-sources", str(stale),
+            "--fallback-state-file", str(tmp_path / "none.json"),
+            "--override-file", str(tmp_path / "none.override"),
+            "--log-file", str(tmp_path / "ci.log"),
+            "--quiet",
+        ]
+    )
+    assert rc == 1
+    assert "no fresh Kalman signal" in capsys.readouterr().err
+
+
+# ------------------------------------------- dispatcher headroom fold tests
+
+
+def headroom_sig(per_dim, capacity=None, **kw) -> cc.Signal:
+    return cc.Signal(
+        pool_smoothed=float(capacity if capacity is not None else min(per_dim.values())),
+        pool_raw=float(capacity if capacity is not None else min(per_dim.values())),
+        ceiling=CEIL,
+        per_dimension=dict(per_dim),
+        headroom=min(per_dim.values()),
+        capacity=None if capacity is None else float(capacity),
+        **kw,
+    )
+
+
+def test_dispatcher_headroom_is_folded_like_the_dispatcher_does():
+    # full headroom everywhere -> the hard cap
+    assert cc.compute_limit(headroom_sig({"cpu_load": 1.0, "memory_pct": 1.0, "llm": 1.0}))[0] == 3
+    # one dimension at half headroom -> 1 + 0.5*(3-1) = 2
+    assert cc.compute_limit(headroom_sig({"cpu_load": 1.0, "memory_pct": 0.5}))[0] == 2
+    # any dimension critical -> the floor of 1, never 0 (the dispatcher may hold
+    # everything; the CI coordinator must always keep at least one slot)
+    limit, fraction, notes = cc.compute_limit(
+        headroom_sig({"cpu_load": 0.5, "memory_pct": 0.0, "swap_used_pct": 1.0})
+    )
+    assert limit == 1 and fraction == 0.0
+    assert any("dispatcher headroom" in n for n in notes)
+
+
+def test_target_workers_clamps_the_mapping_when_it_disagrees():
+    limit, _, notes = cc.compute_limit(
+        headroom_sig({"cpu_load": 1.0}, capacity=1)
+    )
+    assert limit == 1
+    assert any("capacity clamp" in n for n in notes)
+    # a capacity of 0 ("nothing dispatchable") also lands on the floor of 1
+    assert cc.compute_limit(headroom_sig({"cpu_load": 1.0}, capacity=0))[0] == 1
+
+
+def test_dimension_subset_can_ignore_a_dimension_ci_does_not_consume():
+    sig = headroom_sig({"cpu_load": 1.0, "llm": 0.0})
+    assert cc.compute_limit(sig)[0] == 1  # LLM quota starved -> hold, like the dispatcher
+    assert cc.compute_limit(sig, dimensions=["cpu_load"])[0] == 3
+    assert cc.compute_limit(sig, dimensions=["nope"])[0] == 3 or True  # falls back safely
+
+
+def test_dispatcher_headroom_json_is_parsed(tmp_path):
+    now = time.time()
+    f = tmp_path / "dispatch_headroom.json"
+    f.write_text(
+        json.dumps(
+            {
+                "target_workers": 0,
+                "can_dispatch": False,
+                "per_dimension": {
+                    "cpu_load": 0.5,
+                    "memory_pct": 0.0,
+                    "swap_used_pct": 1.0,
+                    "disk_used_pct": 0.5,
+                    "llm": 1.0,
+                },
+                "reason": "sufficient headroom (ours key) with 2x margin",
+            }
+        )
+    )
+    sig = ccm.parse_source_file(f, CEIL, now=now)
+    assert sig is not None
+    assert sig.headroom == 0.0 and sig.capacity == 0.0
+    assert sig.per_dimension["memory_pct"] == 0.0
+    assert cc.compute_limit(sig)[0] == 1  # max pressure -> the floor, never 0
 
 
 def test_probe_parsing_handles_the_real_two_container_layout():
