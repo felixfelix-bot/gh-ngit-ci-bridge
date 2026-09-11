@@ -78,11 +78,30 @@ Behaviour:
 
 * **idempotent** — same limit as the live `.env` value means *no recreate* (the
   coordinator container is only touched when the number actually changes);
-* **idle-gated** — a change recreates the coordinator, which kills an in-flight
-  job, so the controller applies only when it can *prove* the coordinator is
-  idle (no trigger started-but-unfinished in the log, no fresh `act-*` job
-  container in the dind daemon, no fresh enqueue) and re-checks idle
-  immediately before applying; otherwise it defers to the next tick;
+* **single-flight** — an exclusive `flock` on
+  `~/.local/state/gh-ngit-ci-bridge/ci-concurrency.lock` means the 5-minute
+  timer and a manual tick can never overlap; the loser exits `3` (logged as
+  `lock_held`) instead of racing a second recreate;
+* **quiet-window fenced** — a single idle sample is not a fence. A change is
+  applied only when the coordinator is provably idle at *both* ends of a settle
+  window (`--settle-s`, default 90 s): no new trigger/repo-event/queue log line,
+  no change in the live `act-*` container set, and no queued job in the queue
+  checkpoint — then sampled once more immediately before the recreate. Any
+  change aborts the tick (`defer`, with the reason logged). An `act-*`
+  container older than the coordinator's own 30-minute job timeout is an
+  **orphan**: reported under `fence.orphans`, never blocking and never mistaken
+  for a live job;
+* **drain-safe apply** — the value is applied with
+  `docker compose stop -t <stop-grace> coordinator` (default 1980 s = the
+  coordinator's own `stop_grace_period`) *before* `docker compose up -d`. The
+  coordinator treats SIGTERM as a graceful drain (it finishes in-flight jobs and
+  checkpoints the unstarted ones), so a job that starts inside the fence's last
+  gap is drained rather than killed. The tick records `stop_took_s` and whether
+  a `graceful drain` line was observed;
+* **verified** — after the recreate the controller reads
+  `NGIT_CI_MAX_CONCURRENT_JOBS` *from inside the running container*
+  (`docker compose exec … printenv`), not just from `.env`; a mismatch is
+  logged as `apply verification FAILED` and the tick defers;
 * **override** — `echo 2 > ~/.local/state/gh-ngit-ci-bridge/ci-concurrency.override`
   (or `KALMAN_CI_CONCURRENCY_PIN=2`, or `--override 2`) pins the value; the pin
   is respected and logged;

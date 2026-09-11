@@ -94,9 +94,35 @@ dispatcher publishes a 0..1 fraction. `--signal-ceiling` overrides.
 
 ## 3. Safety around the recreate
 
-Changing concurrency means `docker compose up -d coordinator`, which **kills any
-in-flight job**. The controller therefore applies **only when it can prove the
-coordinator is idle**, from two independent sources:
+Changing concurrency means editing `.env` and restarting the coordinator. Two
+independent mechanisms keep that from killing work.
+
+**(a) The restart is a drain, not a kill.** The coordinator handles SIGTERM as a
+graceful shutdown: it freezes intake, lets every *running* job finish
+(`run_job_executor` joins its running tasks before returning the frozen,
+unstarted ones — `src/queue.rs`), checkpoints the unstarted jobs to
+`/data/queued-jobs.json`, and only then exits. Its compose service declares
+`stop_grace_period: 33m` (the 30 min job timeout + the 2 min Blossom budget +
+overhead), and `docker compose` honours that on a config-change recreate —
+*measured* on DQ05 with a probe container whose TERM handler takes 25 s:
+`docker compose up -d` (config change) took **26 s** and the old container
+logged `GOT_SIGTERM` → `DRAIN_DONE`; `docker stop -t 1980` likewise waited out
+the whole handler. So the controller does not depend on that choice: it applies
+through the **explicit drain order** (`docker compose stop -t <stop-grace>
+coordinator`, then `up -d coordinator`), and reads the stopped container's log
+back to record whether a `graceful drain` line was actually seen
+(`apply.graceful_drain_observed`, `apply.stop_took_s`).
+
+**(b) The restart is fenced.** The coordinator also starts jobs autonomously, so
+a job can begin between the controller's last sample and the SIGTERM. The drain
+then waits for that job (the change lands late; nothing is killed), but the
+controller will not restart the coordinator while work is plausible at all.
+It applies only when the coordinator is **provably idle across a settle window**
+(`--settle-s`, default 90 s, `KALMAN_CI_SETTLE_S`): a second sample after the
+window, compared against the first, and a third sample immediately before the
+recreate. Any new trigger/repo-event/queue log line, change in the live `act-*`
+container set, or change in the queue checkpoint aborts the tick. Idleness
+itself is proved from two independent sources:
 
 1. **Coordinator log** — every `Starting queued CI job trigger_event=X` must be
    paired with a `Completed embedded CI for trigger trigger_event=X`; an
@@ -110,12 +136,36 @@ coordinator is idle**, from two independent sources:
    long after its run finished) and is dismissed as stale, so the controller
    cannot deadlock on it.
 
+3. **Queue checkpoint** — `/data/queued-jobs.json` lists jobs frozen by an
+   earlier drain. A checkpoint with jobs that is still inside
+   `NGIT_CI_QUEUE_RECOVERY_WINDOW_SECS` (default 600 s) means unstarted work
+   exists → busy. An older checkpoint is *discarded by ngit-ci on start*, so it
+   is ignored (and reported), never allowed to block a change forever.
+
 And then:
 
-* the idle check is **re-run immediately before applying** (probe → decide →
-  re-probe → apply), so a job that appeared in between aborts the apply;
-* `--force-recreate` exists to skip the guard (dangerous, not used);
-* failures to verify fail **closed** (`defer`), never open.
+* **mutual exclusion** — an exclusive `flock`
+  (`~/.local/state/gh-ngit-ci-bridge/ci-concurrency.lock`) serialises the timer
+  against manual ticks; the loser exits `3` and logs `lock_held`;
+* the fence is **re-sampled immediately before the recreate** (probe → decide →
+  settle → re-probe → re-probe → apply), so a job that appeared at any point
+  aborts the apply;
+* an orphan `act-*` container is **reported** (`fence.orphans`, with its age) and
+  does not block; anything that might be live does;
+* `--force-recreate` still exists to skip the guard (dangerous, not used). Even
+  then the apply goes through the drain, so it does not kill a running job;
+* failures to prove idle, or to verify the applied value **inside the running
+  container**, fail **closed** (`defer`), never open.
+
+No live reload exists to avoid the restart altogether: `NGIT_CI_MAX_CONCURRENT_JOBS`
+is parsed once at startup (`src/config.rs`, `Config::parse`) and becomes a fixed
+`Arc<Semaphore>` permit count in `run_job_executor` (`src/queue.rs`); the binary
+installs handlers for `SIGTERM`/`SIGINT` only (`src/main.rs`), there is no admin
+socket or HTTP endpoint, the only Nostr control kinds are 9843 Service Request /
+9844 Service Stop (no config payload), and every coordinator option is exported
+as `reload_behavior: "restart_required"` (`src/docs_export.rs`) — only secret
+*sources* are marked live. So the restart is unavoidable, and the job is to make
+it a drain instead of a kill.
 
 Idempotence: same value as `.env` ⇒ `noop`, and **no container is recreated**.
 `.env` is backed up (`.env.bak.<UTCts>`, mode 600 preserved) before every write.
