@@ -297,6 +297,30 @@ seconds later, after the container was removed. The parallel entry for the
 * the last tick (14:26:31Z, **no override**) is a pure signal-driven apply:
   `headroom 0.5, capacity 2 → limit 3 → 2`.
 
+### 6b. Unattended operation and end-to-end pipeline check
+
+After the manual validation, the timer ran on its own (no hand-run tick) and the
+ngit push of this work triggered a real CI run through the whole pipeline:
+
+```
+$ journalctl --user -u kalman-ci-concurrency.service | tail
+Sep 11 19:53:44 Starting kalman-ci-concurrency.service ...
+Sep 11 19:53:45 Finished kalman-ci-concurrency.service ...
+Sep 11 19:58:45 Starting kalman-ci-concurrency.service ...
+Sep 11 19:58:45 Finished kalman-ci-concurrency.service ...
+
+2026-09-11T14:28:45Z NOOP 2 -> 2 | headroom 0.5 | idle True | unchanged: computed limit 2 == live value 2
+
+$ ssh dq05 'docker compose logs --tail=300 coordinator | grep -E "Starting queued|Completed embedded|max_concurrent"'
+ngit_ci: Configured runner ... max_concurrent_jobs=2 max_queued_jobs=64 job_timeout_secs=1800
+ngit_ci::queue: Starting queued CI job trigger_event=6986a335... workflow=.ngit/act/workflows/bridge-smoke.yml queue_wait_ms=0 running_jobs=1
+ngit_ci: Completed embedded CI ... conclusion="success" exit_code=Some(0)
+```
+
+So: the coordinator recreations did not break the CI pipeline (a job triggered by
+the ngit mirror push ran to `conclusion="success"` afterwards), and the timer
+keeps it converged without intervention.
+
 ## 7. Install status
 
 ```
