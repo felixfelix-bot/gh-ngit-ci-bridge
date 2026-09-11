@@ -693,8 +693,15 @@ def main(argv: list[str]) -> int:
                 if decision.action == MIRROR_PUSH:
                     pushed, push_detail = mirror.push_to_ngit(slug, repo_id, branch, sha)
                     if pushed:
-                        time.sleep(cfg.get("state_event_wait_seconds", 8))
-                        event = nostr.latest_state_event(repo_id, owner_hex)
+                        # The relay can take a few seconds to index the freshly
+                        # published 30618, so poll for it. This lookup is evidence
+                        # only — success is already proven by verified_mirror_head.
+                        event = None
+                        for attempt in range(cfg.get("state_event_poll_attempts", 4)):
+                            time.sleep(cfg.get("state_event_wait_seconds", 8) if attempt == 0 else 6)
+                            event = nostr.latest_state_event(repo_id, owner_hex)
+                            if event and sha in json.dumps(event.get("tags", [])):
+                                break
                         event_id = event["id"] if event else None
                         carried = bool(event and sha in json.dumps(event.get("tags", [])))
                         log(
