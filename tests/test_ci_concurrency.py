@@ -1293,7 +1293,7 @@ def test_classify_idle_defers_on_a_queued_job():
 def test_the_apply_drains_before_recreating_and_verifies_the_runtime_value():
     script = ccm.APPLY_SCRIPT
     drain = script.index("docker compose stop -t __GRACE__ coordinator")
-    recreate = script.index("docker compose up -d coordinator")
+    recreate = script.index("docker compose up -d --force-recreate coordinator")
     assert drain < recreate, "the stop (drain) must precede the recreate"
     assert "RUNTIME_VALUE=" in script
     assert "DRAIN_TAIL:" in script

@@ -93,11 +93,13 @@ Behaviour:
   for a live job;
 * **drain-safe apply** — the value is applied with
   `docker compose stop -t <stop-grace> coordinator` (default 1980 s = the
-  coordinator's own `stop_grace_period`) *before* `docker compose up -d`. The
-  coordinator treats SIGTERM as a graceful drain (it finishes in-flight jobs and
-  checkpoints the unstarted ones), so a job that starts inside the fence's last
-  gap is drained rather than killed. The tick records `stop_took_s` and whether
-  a `graceful drain` line was observed;
+  coordinator's own `stop_grace_period`) *before*
+  `docker compose up -d --force-recreate`. The coordinator treats SIGTERM as a
+  graceful drain (it finishes in-flight jobs and checkpoints the unstarted
+  ones), so a job that starts inside the fence's last gap is drained rather than
+  killed; the forced recreate then guarantees the new value lands in the new
+  process. The tick records `stop_took_s` and whether a `graceful drain` line
+  was observed;
 * **verified** — after the recreate the controller reads
   `NGIT_CI_MAX_CONCURRENT_JOBS` *from inside the running container*
   (`docker compose exec … printenv`), not just from `.env`; a mismatch is

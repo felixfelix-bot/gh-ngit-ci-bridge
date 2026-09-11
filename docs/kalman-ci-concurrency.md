@@ -109,8 +109,10 @@ overhead), and `docker compose` honours that on a config-change recreate —
 logged `GOT_SIGTERM` → `DRAIN_DONE`; `docker stop -t 1980` likewise waited out
 the whole handler. So the controller does not depend on that choice: it applies
 through the **explicit drain order** (`docker compose stop -t <stop-grace>
-coordinator`, then `up -d coordinator`), and reads the stopped container's log
-back to record whether a `graceful drain` line was actually seen
+coordinator`, then `up -d --force-recreate coordinator`: the container is already
+stopped, so that is a removal + creation, and it cannot silently reuse the
+stopped container with the old environment), and reads the stopped container's
+log back to record whether a `graceful drain` line was actually seen
 (`apply.graceful_drain_observed`, `apply.stop_took_s`).
 
 **(b) The restart is fenced.** The coordinator also starts jobs autonomously, so

@@ -302,7 +302,11 @@ echo "STOP_TOOK_S=$(( $(date +%s) - s ))"
 # read it back so the decision log can carry proof that the drain happened.
 echo "DRAIN_TAIL:"
 docker compose logs --tail=8 coordinator 2>&1 | sed 's/^/  /'
-docker compose up -d coordinator 2>&1 | tail -6
+# --force-recreate: the container is already stopped (the drain finished), so
+# this is a removal + creation, not a stop. It guarantees the new .env value
+# lands in the new process instead of risking compose reusing the stopped
+# container with the old environment.
+docker compose up -d --force-recreate coordinator 2>&1 | tail -6
 # The value that matters is the one inside the running process, not the one in
 # the file: verify both.
 echo "RUNTIME_VALUE=$(docker compose exec -T coordinator printenv NGIT_CI_MAX_CONCURRENT_JOBS < /dev/null 2>/dev/null || echo UNKNOWN)"
