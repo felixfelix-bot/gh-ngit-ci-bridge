@@ -404,6 +404,17 @@ _PLAN_RE = re.compile(r"Planning CI for ")
 # The timestamp is the FIRST RFC3339 field in the line: `docker compose logs`
 # prefixes each line with "<service>-1  | " before the message's own timestamp.
 _TS_RE = re.compile(r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?)")
+#: ANSI SGR escapes. The coordinator's tracing output is COLOURED even when its
+#: stdout is a pipe (`docker compose logs` on this deployment returns
+#: ``<ts> INFO <target>: Enqueued CI job `` with the field names wrapped in
+#: ``\x1b[3m…\x1b[0m``), so a pattern like
+#: ``Enqueued CI job trigger_event=`` cannot match the raw bytes. Live evidence:
+#: on 2026-09-11T19:53:48Z a real job was enqueued and started, yet every
+#: lifecycle counter stayed 0 and the log-based idle proof saw no in-flight
+#: trigger - the fence only caught that job through the dind container channel.
+#: Strip the escapes before matching (and hash the stripped line, so the same
+#: logical line hashes identically however it is coloured).
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 _ACT_NAME_RE = re.compile(r"^act-")
 
 #: A job that was just enqueued has not started yet; treat a fresh enqueue as
@@ -465,6 +476,7 @@ def parse_coordinator_log(text: str) -> dict:
     lifecycle_hashes: set[str] = set()
 
     for line in text.splitlines():
+        line = _ANSI_RE.sub("", line)
         ts = _parse_ts(line)
         if _ACTIVITY_RE.search(line):
             # Identity of this *instance* of a trigger/repo-event/queue line, so

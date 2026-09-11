@@ -104,6 +104,12 @@ Behaviour:
   `NGIT_CI_MAX_CONCURRENT_JOBS` *from inside the running container*
   (`docker compose exec … printenv`), not just from `.env`; a mismatch is
   logged as `apply verification FAILED` and the tick defers;
+* **colour-proof parsing** — the coordinator's tracing output is coloured even
+  into a pipe (`Enqueued CI job \x1b[3mtrigger_event\x1b[0m\x1b[2m=\x1b[0m…`), so
+  the parser strips ANSI escapes before matching. Without that every lifecycle
+  counter silently reads `0` in production and the log-based idle proof is dead
+  — observed live: a real running job was caught only by the dind container
+  channel;
 * **override** — `echo 2 > ~/.local/state/gh-ngit-ci-bridge/ci-concurrency.override`
   (or `KALMAN_CI_CONCURRENCY_PIN=2`, or `--override 2`) pins the value; the pin
   is respected and logged;

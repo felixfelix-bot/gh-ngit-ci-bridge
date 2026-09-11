@@ -144,6 +144,18 @@ itself is proved from two independent sources:
    exists → busy. An older checkpoint is *discarded by ngit-ci on start*, so it
    is ignored (and reported), never allowed to block a change forever.
 
+**Pitfall found live (fixed):** the coordinator's tracing output is coloured
+*even when its stdout is a pipe*, so a lifecycle line arrives as
+`Enqueued CI job \x1b[3mtrigger_event\x1b[0m\x1b[2m=\x1b[0m<id> …` and a plain
+pattern like `Enqueued CI job trigger_event=` never matches the raw bytes. Before
+the fix, every lifecycle counter was silently `0` in production: the log-based
+idle proof (proof 1 above, and the "new trigger/repo-event/queue log line"
+channel of the fence) was dead, and a real job running during a live tick was
+caught **only** by the dind container channel (proof 2). The parser now strips
+ANSI SGR escapes before matching, and the real captured bytes are regression
+tests (`test_ansi_coloured_production_lines_are_parsed`,
+`test_the_coloured_line_really_would_not_match_unstripped`).
+
 And then:
 
 * **mutual exclusion** — an exclusive `flock`

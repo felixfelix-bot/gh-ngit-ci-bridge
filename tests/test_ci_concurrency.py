@@ -1315,3 +1315,62 @@ def test_the_apply_drains_before_recreating_and_verifies_the_runtime_value():
     assert seen["script"].count("docker compose stop -t 1980 coordinator") == 1
     assert "__GRACE__" not in seen["script"] and "__LIMIT__" not in seen["script"]
     assert seen["timeout"] > 1980, "a full 30-minute drain is a success, not a timeout"
+
+
+# ------------------------------------------- coloured production log lines
+#
+# Captured verbatim from DQ05 while a REAL job ran during a live tick
+# (`docker compose logs --tail=… coordinator`, 2026-09-11T19:53:48Z). The
+# coordinator's tracing output is coloured even into a pipe, so the field names
+# are wrapped in escapes and the raw bytes never contain
+# "Starting queued CI job trigger_event=". Every lifecycle counter was
+# therefore silently 0 in production: the log-based idle proof was dead, and
+# the fence only caught that running job through the dind container channel.
+
+JOB_TRIGGER = "f889a3b2e7685d798521bd80ab7bd6cadc20bbf60c00354a45bd4dac49e39795"
+ANSI_ENQUEUED = (
+    "coordinator-1  | \x1b[2m2026-09-11T19:53:48.199460Z\x1b[0m \x1b[32m INFO\x1b[0m "
+    "\x1b[2mngit_ci\x1b[0m\x1b[2m:\x1b[0m Enqueued CI job "
+    "\x1b[3mtrigger_event\x1b[0m\x1b[2m=\x1b[0m" + JOB_TRIGGER + " "
+    "\x1b[3mqueued\x1b[0m\x1b[2m=\x1b[0m1 \x1b[3mcapacity\x1b[0m\x1b[2m=\x1b[0m64"
+)
+ANSI_STARTED = (
+    "coordinator-1  | \x1b[2m2026-09-11T19:53:48.199502Z\x1b[0m \x1b[32m INFO\x1b[0m "
+    "\x1b[2mngit_ci::queue\x1b[0m\x1b[2m:\x1b[0m Starting queued CI job "
+    "\x1b[3mtrigger_event\x1b[0m\x1b[2m=\x1b[0m" + JOB_TRIGGER + " "
+    "\x1b[3mworkflow\x1b[0m\x1b[2m=\x1b[0m.ngit/act/workflows/validate-feed.yml "
+    "\x1b[3mqueue_wait_ms\x1b[0m\x1b[2m=\x1b[0m0 \x1b[3mrunning_jobs\x1b[0m\x1b[2m=\x1b[0m1"
+)
+ANSI_JOB_TS = ccm._iso_to_epoch("2026-09-11T19:53:48.199502Z")
+assert ANSI_JOB_TS is not None
+
+
+def test_the_coloured_line_really_would_not_match_unstripped():
+    """The fix only matters if the raw bytes genuinely fail to match."""
+    assert "Starting queued CI job trigger_event=" not in ANSI_STARTED
+    assert "Starting queued CI job trigger_event=" in cc._ANSI_RE.sub("", ANSI_STARTED)
+
+
+def test_ansi_coloured_production_lines_are_parsed():
+    log = ANSI_ENQUEUED + "\n" + ANSI_STARTED
+    parsed = cc.parse_coordinator_log(log)
+    assert parsed["enqueued"] == 1, parsed
+    assert parsed["started"] == 1, parsed
+    assert parsed["in_flight"] == [JOB_TRIGGER], parsed
+    assert parsed["newest_activity_ts"] == ANSI_JOB_TS
+
+    idle, reason, facts = cc.classify_idle(log, [], now=ANSI_JOB_TS + 60)
+    assert idle is False, reason
+    assert "not completed" in reason
+    assert facts["in_flight"] == [JOB_TRIGGER]
+
+
+def test_new_activity_sees_a_new_coloured_lifecycle_line():
+    """The log channel - not just the dind container channel - must see the job."""
+    now = ANSI_JOB_TS + 60
+    changed, why = cc.new_activity(
+        cc.fingerprint_jobs(ANSI_ENQUEUED, [], now=now),
+        cc.fingerprint_jobs(ANSI_ENQUEUED + "\n" + ANSI_STARTED, [], now=now),
+    )
+    assert changed is True
+    assert "new trigger/repo-event/queue log line" in why
