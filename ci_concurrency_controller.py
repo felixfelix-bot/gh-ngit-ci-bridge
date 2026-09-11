@@ -107,13 +107,17 @@ echo "===LOGS==="
 # last job entirely.
 docker compose logs --tail=3000 coordinator 2>&1
 echo "===ACT==="
-names=$(docker compose exec -T dind docker ps -a --format '{{.Names}}' 2>/dev/null | grep '^act-' || true)
+# NOTE: every `docker compose exec` needs `< /dev/null`. This script is fed to
+# `ssh ... bash -s` on STDIN, and without the redirect the exec'd process
+# consumes the rest of the script - the ACT/QUEUE sections silently never ran
+# and the idle check was left with only the log-based proof (observed live).
+names=$(docker compose exec -T dind docker ps -a --format '{{.Names}}' < /dev/null 2>/dev/null | grep '^act-' || true)
 for n in $names; do
   docker compose exec -T dind docker inspect "$n" \
-    --format '{{.Name}}|{{.State.Status}}|{{.State.StartedAt}}' 2>/dev/null
+    --format '{{.Name}}|{{.State.Status}}|{{.State.StartedAt}}' < /dev/null 2>/dev/null
 done
 echo "===QUEUE==="
-docker compose exec -T coordinator sh -c 'cat /data/queued-jobs.json 2>/dev/null | head -c 4000' 2>/dev/null
+docker compose exec -T coordinator sh -c 'cat /data/queued-jobs.json 2>/dev/null | head -c 4000' < /dev/null 2>/dev/null
 echo "===END==="
 """
 

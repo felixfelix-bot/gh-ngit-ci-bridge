@@ -779,6 +779,19 @@ def test_probe_parsing_handles_the_real_two_container_layout():
     assert idle is True, reason
 
 
+def test_probe_script_redirects_stdin_for_every_compose_exec():
+    """`ssh host bash -s` feeds the script on stdin.
+
+    Without `< /dev/null` the exec'd process swallows the rest of the script: in
+    production the ACT and QUEUE sections silently never ran, so the dind-based
+    idle check was a no-op and the decision rested on the log alone.
+    """
+    execs = ccm.PROBE_SCRIPT.count("docker compose exec")
+    redirects = ccm.PROBE_SCRIPT.count("< /dev/null")
+    assert execs >= 3, execs  # dind ps, dind inspect, coordinator cat
+    assert redirects == execs, f"{execs} compose exec calls but {redirects} stdin redirects"
+
+
 def test_no_key_material_is_read_by_the_module():
     src = Path(ccm.__file__).read_text()
     for banned in ("nsec", "private key", "bunker://"):
