@@ -33,6 +33,7 @@
   "trigger_mode": "mirror",
   "also_manual_when_workflows": false,
   "baseline_on_first_run": true,
+  "max_trigger_attempts": 3,
   "commits_per_poll": 20,
   "mirror_refresh_minutes": 60,
   "org_cache_minutes": 360,

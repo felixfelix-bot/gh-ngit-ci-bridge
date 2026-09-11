@@ -126,6 +126,7 @@ def load_state(path: Path) -> dict[str, Any]:
         return {
             "version": STATE_VERSION,
             "seen": {},
+            "failures": {},
             "heads": {},
             "mirror_map": {},
             "mirror_map_refreshed_at": 0,
@@ -135,11 +136,31 @@ def load_state(path: Path) -> dict[str, Any]:
     with path.open() as handle:
         state = json.load(handle)
     state.setdefault("seen", {})
+    state.setdefault("failures", {})
     state.setdefault("heads", {})
     state.setdefault("mirror_map", {})
     state.setdefault("org_repo_cache", {})
     state.setdefault("counters", {"ticks": 0, "decisions": {}, "triggers": 0})
     return state
+
+
+def record_failure(state: dict, sha: str, slug: str, branch: str, detail: str, cfg: dict) -> None:
+    """Remember a failed trigger without consuming the commit.
+
+    A failed publish must not silently swallow a commit: it is retried on the
+    next tick up to `max_trigger_attempts` times; after that it is recorded as
+    seen so the log stops repeating a permanently broken push.
+    """
+    entry = state["failures"].get(sha, {"attempts": 0})
+    entry["attempts"] = entry.get("attempts", 0) + 1
+    entry.update({"slug": slug, "branch": branch, "at": utcnow(), "reason": detail[:200]})
+    state["failures"][sha] = entry
+    if entry["attempts"] >= cfg.get("max_trigger_attempts", 3):
+        state["seen"][sha] = {
+            "slug": slug, "branch": branch, "at": utcnow(),
+            "action": "error", "reason": detail[:200], "attempts": entry["attempts"],
+        }
+        state["failures"].pop(sha, None)
 
 
 def save_state(path: Path, state: dict) -> None:
@@ -311,25 +332,6 @@ class Mirror:
     def _repo_dir(self, slug: str) -> Path:
         return self.cache_dir / slug.replace("/", "__")
 
-    def _nostr_env(self) -> dict:
-        """Feed nostr.nsec/npub to git via env, never via argv."""
-        env = dict(os.environ)
-        env["GIT_CONFIG_COUNT"] = "3"
-        env["GIT_CONFIG_KEY_0"] = "nostr.nsec"
-        env["GIT_CONFIG_VALUE_0"] = self._key_nsec()
-        env["GIT_CONFIG_KEY_1"] = "nostr.npub"
-        env["GIT_CONFIG_VALUE_1"] = self.cfg["ngit_owner_npub"]
-        env["GIT_CONFIG_KEY_2"] = "nostr.default_servers"
-        env["GIT_CONFIG_VALUE_2"] = "relay.ngit.dev"
-        return env
-
-    def _key_nsec(self) -> str:
-        key_file = Path(os.path.expanduser(self.cfg["key_file"]))
-        match = NSEC_RE.search(key_file.read_text())
-        if not match:
-            raise RuntimeError(f"no nsec in {key_file}")
-        return match.group(0)
-
     def prepare(self, slug: str, branch: str, sha: str) -> tuple[bool, str]:
         """Make sure `sha` exists locally; returns (ok, detail)."""
         directory = self._repo_dir(slug)
@@ -370,21 +372,107 @@ class Mirror:
             return []
         return [line.strip() for line in out.splitlines() if line.strip().endswith((".yml", ".yaml"))]
 
-    def push_to_ngit(self, slug: str, repo_id: str, branch: str, sha: str) -> tuple[bool, str]:
+    def _write_ngit_identity(self, directory: Path) -> None:
+        """Put nostr.nsec/npub into the clone's LOCAL git config.
+
+        git-remote-nostr resolves the signing identity from the repository's own
+        config, NOT from GIT_CONFIG_* environment injection (verified
+        2026-09-11: with the env set it still reported the machine-global
+        ngit account and refused the push as a non-maintainer). The value is
+        written by editing the file directly so the key never appears in argv,
+        and the config is kept at mode 600 inside a 700 cache directory.
+        """
+        cfg = directory / ".git" / "config"
+        text = cfg.read_text()
+        lines = text.splitlines()
+        nsec = self._key_nsec()
+        npub = self.cfg["ngit_owner_npub"]
+        def set_key(lines: list[str], key: str, value: str) -> list[str]:
+            for index, line in enumerate(lines):
+                if line.strip().startswith(f"{key} ="):
+                    lines[index] = f"\t{key} = {value}"
+                    return lines
+            for index, line in enumerate(lines):
+                if line.strip() == "[nostr]":
+                    lines.insert(index + 1, f"\t{key} = {value}")
+                    return lines
+            lines += ["[nostr]", f"\t{key} = {value}"]
+            return lines
+
+        lines = set_key(lines, "npub", npub)
+        lines = set_key(lines, "nsec", nsec)
+        cfg.write_text("\n".join(lines) + "\n")
+        os.chmod(cfg, 0o600)
+
+    def _ngit_url(self, repo_id: str) -> str:
+        return f"nostr://{self.cfg['ngit_owner_npub']}/relay.ngit.dev/{repo_id}"
+
+    def _key_nsec(self) -> str:
+        key_file = Path(os.path.expanduser(self.cfg["key_file"]))
+        match = NSEC_RE.search(key_file.read_text())
+        if not match:
+            raise RuntimeError(f"no nsec in {key_file}")
+        return match.group(0)
+
+    def configure(self, slug: str, repo_id: str) -> tuple[bool, str]:
         directory = self._repo_dir(slug)
-        remote = f"nostr://{self.cfg['ngit_owner_npub']}/relay.ngit.dev/{repo_id}"
+        if not (directory / ".git").exists():
+            return False, "no cache clone"
+        try:
+            self._write_ngit_identity(directory)
+        except OSError as exc:
+            return False, f"cannot write nostr identity config: {exc}"
+        run(["git", "-C", str(directory), "remote", "remove", "ngit"])  # may not exist
+        code, _, err = run(["git", "-C", str(directory), "remote", "add", "ngit", self._ngit_url(repo_id)])
+        if code != 0:
+            return False, f"cannot add ngit remote: {self.log.redact(err.strip()[:200])}"
+        return True, "ok"
+
+    def mirror_head(self, repo_id: str, branch: str) -> str | None:
+        """Ground truth: what the ngit mirror actually serves over https."""
+        url = f"https://relay.ngit.dev/{self.cfg['ngit_owner_npub']}/{repo_id}.git"
+        code, out, _ = run(["git", "ls-remote", url, f"refs/heads/{branch}"], timeout=120)
+        if code != 0:
+            return None
+        for line in out.splitlines():
+            parts = line.split()
+            if len(parts) == 2:
+                return parts[0]
+        return None
+
+    def push_to_ngit(self, slug: str, repo_id: str, branch: str, sha: str) -> tuple[bool, str]:
+        """Publish a branch to the ngit mirror and VERIFY it landed.
+
+        git-remote-nostr is unreliable about its own exit status: a maintainer
+        rejection prints `error refs/heads/<b> your nostr account ... isn't
+        listed as a maintainer` and still exits 0, and a successful push can
+        print `Error: could not update remote_ref locally` while the ref was in
+        fact written. So the return value is decided by `git ls-remote` against
+        the mirror, never by the push exit code.
+        """
+        directory = self._repo_dir(slug)
+        ok, detail = self.configure(slug, repo_id)
+        if not ok:
+            return False, detail
+
+        staging = f"refs/bridge-publish/{branch}"
+        code, _, err = run(["git", "-C", str(directory), "update-ref", staging, sha], timeout=60)
+        if code != 0:
+            return False, f"cannot stage ref: {self.log.redact(err.strip()[:200])}"
+
         code, out, err = run(
-            ["git", "-C", str(directory), "push", "--porcelain", remote, f"{sha}:refs/heads/{branch}"],
-            env=self._nostr_env(),
+            ["git", "-C", str(directory), "push", "ngit", f"{staging}:refs/heads/{branch}"],
             timeout=600,
         )
-        combined = (out + "\n" + err).strip()
-        # git-remote-nostr sometimes reports transport noise while the nostr push
-        # itself succeeded; treat "the ref is now on the mirror" as ground truth
-        # and let the caller verify with ls-remote.
-        if code != 0 and "already exists" not in combined and "Everything up-to-date" not in combined:
-            return False, combined[:400]
-        return True, combined[-400:]
+        transport = self.log.redact((out + "\n" + err).strip())[-400:]
+
+        for attempt in range(3):
+            head = self.mirror_head(repo_id, branch)
+            if head == sha:
+                return True, f"verified_mirror_head={head[:12]} transport={transport[-160:]}"
+            time.sleep(self.cfg.get("mirror_verify_retry_seconds", 5) * (attempt + 1))
+        head = self.mirror_head(repo_id, branch)
+        return False, f"mirror head={head[:12] if head else None} != {sha[:12]}; transport={transport[-240:]}"
 
 
 # ------------------------------------------------------------------------- main
@@ -535,7 +623,13 @@ def main(argv: list[str]) -> int:
                     author_email=(row.get("commit", {}).get("author") or {}).get("email"),
                     actor_login=events_by_sha.get(sha),
                 )
-                is_baseline = known_head is None and state["heads"].get(head_key) is None
+                # --sha means "classify this commit as if it were new": never
+                # treat it as a first-run baseline.
+                is_baseline = (
+                    not args.sha
+                    and known_head is None
+                    and state["heads"].get(head_key) is None
+                )
 
                 if is_baseline and cfg.get("baseline_on_first_run", True):
                     decision = Decision("skip", "baseline_first_run",
@@ -593,8 +687,7 @@ def main(argv: list[str]) -> int:
                 ok, detail = mirror.prepare(slug, branch, sha)
                 if not ok:
                     log(f"{slug}@{branch} {sha[:12]} mirror prepare failed: {detail}", "ERROR")
-                    state["seen"][sha] = {"slug": slug, "branch": branch, "at": utcnow(),
-                                          "action": "error", "reason": detail[:200]}
+                    record_failure(state, sha, slug, branch, detail, cfg)
                     continue
 
                 if decision.action == MIRROR_PUSH:
@@ -606,9 +699,13 @@ def main(argv: list[str]) -> int:
                         carried = bool(event and sha in json.dumps(event.get("tags", [])))
                         log(
                             f"TRIGGER mirror_push {slug}@{branch} sha={sha[:12]} "
-                            f"repo_state_event={event_id} commit_in_state={carried}"
+                            f"repo_state_event={event_id} commit_in_state={carried} "
+                            f"({push_detail.split(' transport=')[0]})"
                         )
                         triggers_fired += 1
+                        # success clears any earlier failure for this sha, so the
+                        # head marker is free to advance again
+                        state["failures"].pop(sha, None)
                         state["seen"][sha] = {
                             "slug": slug, "branch": branch, "at": utcnow(),
                             "action": "mirror_push", "repo_state_event": event_id,
@@ -636,8 +733,7 @@ def main(argv: list[str]) -> int:
                                 triggers_fired += 1
                     else:
                         log(f"TRIGGER mirror_push FAILED {slug} sha={sha[:12]}: {push_detail}", "ERROR")
-                        state["seen"][sha] = {"slug": slug, "branch": branch, "at": utcnow(),
-                                              "action": "error", "reason": push_detail[:200]}
+                        record_failure(state, sha, slug, branch, push_detail, cfg)
                 else:  # MANUAL_9840
                     for wf in decision.workflows:
                         sha256 = mirror.file_sha256(slug, sha, wf)
@@ -659,11 +755,22 @@ def main(argv: list[str]) -> int:
                         state["seen"][sha] = {"slug": slug, "branch": branch, "at": utcnow(),
                                               "action": "manual_9840", "event": event_id}
 
-            # advance the head marker for this repo@branch
+            # advance the head marker for this repo@branch — but NEVER past a
+            # commit whose trigger failed, otherwise the failure would be
+            # silently swallowed (the next tick must see it again).
             if commit_rows and not args.sha:
-                state["heads"][head_key] = commit_rows[0]["sha"]
-                if known_head is None:
-                    log(f"{slug}@{branch} baseline head recorded {commit_rows[0]['sha'][:12]}")
+                newest = commit_rows[0]["sha"]
+                if newest in state["failures"]:
+                    if known_head:
+                        state["heads"][head_key] = known_head
+                    else:
+                        state["heads"].pop(head_key, None)
+                    log(f"{slug}@{branch} head marker held back at "
+                        f"{(known_head or 'none')[:12]} (unresolved failure {newest[:12]})", "WARN")
+                else:
+                    state["heads"][head_key] = newest
+                    if known_head is None:
+                        log(f"{slug}@{branch} baseline head recorded {newest[:12]}")
 
     # ---- stats + summary
     counters = state["counters"]
