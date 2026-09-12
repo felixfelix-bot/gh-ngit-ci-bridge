@@ -18,7 +18,8 @@ test:  ## run the unit tests (decision matrix + public-only gate)
 lint:  ## byte-compile every module
 	$(PY) -m py_compile bridge.py decision.py public_only.py nostr_event.py audit.py \
 	  ci_concurrency.py ci_concurrency_controller.py \
-	  tests/test_decision.py tests/test_public_only.py tests/test_ci_concurrency.py
+	  tests/test_decision.py tests/test_public_only.py tests/test_ci_concurrency.py \
+  tests/test_default_branch.py
 	@echo "compile ok"
 
 dry:  ## classify only: no publishes, no state changes

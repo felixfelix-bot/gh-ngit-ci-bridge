@@ -230,6 +230,47 @@ def select_public_repos(
     return allowed, skipped, results
 
 
+def resolve_branches(
+    slug: str,
+    spec_cfg: dict,
+    branch_allow: list[str],
+    gh: "Github",
+    state: dict[str, Any],
+    log: Log,
+) -> list[str]:
+    """Branches to probe for one repo on this tick.
+
+    An explicit per-repo ``repos.<slug>.branches`` list always wins. Otherwise
+    the repo's real default branch is resolved from GitHub - one API call per
+    slug per tick, not one per commit - and that is what gets probed, so a repo
+    whose default branch is neither ``main`` nor ``master`` no longer asks
+    GitHub for a branch it does not have (a 404 and a WARN line every tick).
+
+    ``branch_allow`` stays the fallback whenever the lookup fails or returns
+    nothing, and an allow-listed branch that already carries a tracked head is
+    kept: those are branches the repo genuinely has, so mirroring never loses a
+    branch it was already following.
+    """
+    override = spec_cfg.get("branches")
+    if override:
+        return list(override)
+
+    default = gh.default_branch(slug)
+    if not default:
+        log(
+            f"{slug}: default branch unresolved, falling back to {list(branch_allow)}",
+            "WARN",
+        )
+        return list(branch_allow)
+
+    branches = [default]
+    heads = state.get("heads", {})
+    for candidate in branch_allow:
+        if candidate != default and f"{slug}@{candidate}" in heads:
+            branches.append(candidate)
+    return branches
+
+
 # ------------------------------------------------------------------- gh helpers
 
 
@@ -632,7 +673,7 @@ def main(argv: list[str]) -> int:
 
     for slug in repos:
         spec_cfg = cfg.get("repos", {}).get(slug, {})
-        branches = spec_cfg.get("branches") or branch_allow
+        branches = resolve_branches(slug, spec_cfg, branch_allow, gh, state, log)
         repo_id = spec_cfg.get("ngit_repo_id")
         owner_hex = spec_cfg.get("ngit_owner_hex", cfg["ngit_owner_hex"])
 
